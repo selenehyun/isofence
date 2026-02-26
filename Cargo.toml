@@ -1,0 +1,34 @@
+[package]
+name = "isofence"
+version = "0.1.0"
+edition = "2021"
+description = "Reference Graph based test isolation verification tool for TypeScript"
+license = "MIT"
+repository = "https://github.com/selenehyun/isofence"
+keywords = ["testing", "typescript", "isolation", "mock", "lint"]
+categories = ["development-tools", "command-line-utilities"]
+
+[[bin]]
+name = "isofence"
+path = "src/main.rs"
+
+[dependencies]
+oxc_parser = "0.56"
+oxc_ast = "0.56"
+oxc_span = "0.56"
+oxc_allocator = "0.56"
+oxc_resolver = "6"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rayon = "1"
+miette = { version = "7", features = ["fancy"] }
+ignore = "0.4"
+owo-colors = "4"
+pathdiff = "0.2"
+similar = { version = "2", features = ["inline"] }
+regex = "1"
+
+[dev-dependencies]
+insta = "1"
+tempfile = "3"

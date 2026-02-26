@@ -1,0 +1,22 @@
+{
+  "allowlist": [
+    "src/types/**",
+    "src/constants/**"
+  ],
+
+  "rules": {
+    "mutable-module-var": "error",
+    "mutable-const-init": "error",
+    "top-level-call": "error",
+    "global-mutation": "error",
+    "event-subscription": "error",
+    "top-level-await": "error",
+    "iife": "error",
+    "prototype-mutation": "error",
+    "side-effect-import": "warning",
+    "static-class-field": "error",
+    "mock-consensus": "warning"
+  },
+
+  "customRules": []
+}
