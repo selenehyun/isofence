@@ -83,6 +83,8 @@ impl Rule for DeclarativeRule {
                 span: stmt.span(),
                 help: None,
                 fix: None,
+                import_chain: None,
+                hazard_sources: vec![],
             }]
         } else {
             vec![]

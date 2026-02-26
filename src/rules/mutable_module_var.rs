@@ -65,6 +65,8 @@ impl Rule for MutableModuleVar {
                     span: declarator.span,
                     help: Some("Consider using `const` with an immutable value, or mock this module in tests".to_string()),
                     fix: None,
+                    import_chain: None,
+                    hazard_sources: vec![],
                 }
             })
             .collect()

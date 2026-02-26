@@ -79,6 +79,8 @@ impl Rule for MockConsensus {
                                 text: module_path.to_string_lossy().to_string(),
                                 span: oxc_span::Span::default(),
                             }),
+                            import_chain: None,
+                            hazard_sources: vec![],
                         });
                     }
                 }

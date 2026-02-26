@@ -66,6 +66,8 @@ impl Rule for GlobalMutation {
                     .to_string(),
             ),
             fix: None,
+            import_chain: None,
+            hazard_sources: vec![],
         }]
     }
 }

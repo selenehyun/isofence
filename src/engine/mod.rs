@@ -19,7 +19,7 @@ use crate::engine::parser::{
 };
 use crate::progress::{Progress, SilentProgress};
 use crate::rule::registry::RuleRegistry;
-use crate::rule::{Diagnostic, Fix, Hazard, HazardCategory, Severity};
+use crate::rule::{Diagnostic, Fix, Hazard, HazardCategory, HazardSource, Severity};
 
 /// The main analysis engine.
 pub struct Engine {
@@ -389,22 +389,31 @@ impl Engine {
                         continue;
                     }
 
-                    let module_name = module_path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown");
+                    // Full relative path of hazardous module
+                    let module_rel = pathdiff::diff_paths(module_path, &self.config.project_root)
+                        .unwrap_or_else(|| module_path.clone());
 
-                    let hazard_summary: Vec<String> = hazards
-                        .iter()
-                        .take(3)
-                        .map(|h| h.message.clone())
-                        .collect();
+                    // Compute mock-aware import chain
+                    let chain = ctx.graph.shortest_unmocked_path(
+                        test_file,
+                        module_path,
+                        &test_ctx.mocks,
+                    );
 
                     let message = format!(
-                        "Unmocked hazardous module `{}`: {}",
-                        module_name,
-                        hazard_summary.join("; ")
+                        "Unmocked hazardous module `{}`",
+                        module_rel.display()
                     );
+
+                    let sources: Vec<HazardSource> = hazards
+                        .iter()
+                        .take(3)
+                        .map(|h| HazardSource {
+                            file_path: module_path.clone(),
+                            span: h.span,
+                            message: h.message.clone(),
+                        })
+                        .collect();
 
                     diagnostics.push(Diagnostic {
                         rule_name: "hazard-reachability".to_string(),
@@ -412,14 +421,13 @@ impl Engine {
                         message,
                         file_path: test_file.clone(),
                         span: oxc_span::Span::default(),
-                        help: Some(format!(
-                            "This module has {} hazard(s). Mock it to isolate your tests.",
-                            hazards.len()
-                        )),
+                        help: Some("Mock this module to isolate your tests.".to_string()),
                         fix: Some(Fix {
                             text: module_path.to_string_lossy().to_string(),
                             span: oxc_span::Span::default(),
                         }),
+                        import_chain: chain,
+                        hazard_sources: sources,
                     });
                 }
             }

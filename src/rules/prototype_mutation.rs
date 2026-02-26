@@ -50,6 +50,8 @@ impl Rule for PrototypeMutation {
                         .to_string(),
                 ),
                 fix: None,
+                import_chain: None,
+                hazard_sources: vec![],
             }];
         }
 

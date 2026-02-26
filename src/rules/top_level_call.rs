@@ -47,6 +47,8 @@ impl Rule for TopLevelCall {
                             .to_string(),
                     ),
                     fix: None,
+                    import_chain: None,
+                    hazard_sources: vec![],
                 }]
             }
             _ => vec![],

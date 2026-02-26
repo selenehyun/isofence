@@ -78,6 +78,8 @@ impl Rule for MutableConstInit {
                     span: declarator.span,
                     help: Some("RegExp with global/sticky flags mutates lastIndex on each exec(). Mock this module or remove the flag.".to_string()),
                     fix: None,
+                    import_chain: None,
+                    hazard_sources: vec![],
                 });
                 continue;
             }
@@ -93,6 +95,8 @@ impl Rule for MutableConstInit {
                     span: declarator.span,
                     help: Some("Collections are mutable via .set()/.add(). Mock this module in tests.".to_string()),
                     fix: None,
+                    import_chain: None,
+                    hazard_sources: vec![],
                 });
                 continue;
             }
@@ -120,6 +124,8 @@ impl Rule for MutableConstInit {
                     span: declarator.span,
                     help: Some("const only prevents reassignment, not mutation. Use Object.freeze(), `as const`, or mock this module.".to_string()),
                     fix: None,
+                    import_chain: None,
+                    hazard_sources: vec![],
                 });
             }
         }
@@ -149,6 +155,8 @@ impl MutableConstInit {
                 span: oxc_span::Span::default(),
                 help: Some("Default export of mutable value can leak state. Use Object.freeze() or mock this module.".to_string()),
                 fix: None,
+                import_chain: None,
+                hazard_sources: vec![],
             }];
         }
 

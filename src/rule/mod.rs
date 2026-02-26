@@ -60,6 +60,18 @@ pub struct Diagnostic {
     pub span: Span,
     pub help: Option<String>,
     pub fix: Option<Fix>,
+    /// Import chain from test file to hazardous module (hazard-reachability only).
+    pub import_chain: Option<Vec<PathBuf>>,
+    /// Source locations of hazards in the referenced module (hazard-reachability only).
+    pub hazard_sources: Vec<HazardSource>,
+}
+
+/// Source location of a hazard in a referenced module (for hazard-reachability).
+#[derive(Debug, Clone)]
+pub struct HazardSource {
+    pub file_path: PathBuf,
+    pub span: Span,
+    pub message: String,
 }
 
 /// An auto-fix action.

@@ -39,6 +39,8 @@ impl Rule for TopLevelAwait {
                             .to_string(),
                     ),
                     fix: None,
+                    import_chain: None,
+                    hazard_sources: vec![],
                 }];
             }
         }
@@ -81,6 +83,8 @@ impl Rule for TopLevelAwait {
                                 .to_string(),
                         ),
                         fix: None,
+                        import_chain: None,
+                        hazard_sources: vec![],
                     });
                 }
             }

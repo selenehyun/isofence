@@ -1,11 +1,11 @@
 use owo_colors::OwoColorize;
 use owo_colors::Stream::Stdout;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::engine::EngineResult;
 use crate::reporter::{get_source_line, offset_to_location, Reporter};
-use crate::rule::{Diagnostic, Severity};
+use crate::rule::{Diagnostic, HazardSource, Severity};
 
 pub struct ConsoleReporter {
     pub project_root: std::path::PathBuf,
@@ -102,7 +102,7 @@ impl Reporter for ConsoleReporter {
                 if d.span.start > 0 && !source.is_empty() {
                     render_source_context(&source, d, line_width);
                 } else {
-                    render_fallback(d, line_width);
+                    render_fallback(d, line_width, &self.project_root);
                 }
             }
 
@@ -212,7 +212,7 @@ fn render_source_context(source: &str, d: &Diagnostic, line_width: usize) {
 }
 
 /// Render a fallback for diagnostics without source location (e.g., hazard-reachability).
-fn render_fallback(d: &Diagnostic, line_width: usize) {
+fn render_fallback(d: &Diagnostic, line_width: usize, project_root: &Path) {
     let gutter = " ".repeat(line_width);
     let icon = match d.severity {
         Severity::Error => color_by_severity("⚠", Severity::Error),
@@ -227,6 +227,21 @@ fn render_fallback(d: &Diagnostic, line_width: usize) {
         msg = d.message,
     );
 
+    // Render import chain if present
+    if let Some(ref chain) = d.import_chain {
+        let chain_display = format_import_chain(chain, project_root);
+        println!(
+            " {gutter}    {} {}",
+            "via:".if_supports_color(Stdout, |s| s.dimmed()),
+            chain_display.if_supports_color(Stdout, |s| s.dimmed()),
+        );
+    }
+
+    // Render hazard source lines
+    for hs in &d.hazard_sources {
+        render_hazard_source(&gutter, hs, project_root);
+    }
+
     if let Some(ref help) = d.help {
         println!(
             " {gutter}    {} {}",
@@ -234,6 +249,101 @@ fn render_fallback(d: &Diagnostic, line_width: usize) {
             format!("help: {help}").if_supports_color(Stdout, |s| s.dimmed()),
         );
     }
+}
+
+/// Format a file path as a clickable terminal hyperlink (OSC 8).
+/// Display shows just the filename, link target is the full file:// URI.
+/// Unsupported terminals gracefully show just the display text.
+fn terminal_hyperlink(abs_path: &Path, display_name: &str) -> String {
+    let uri = format!("file://{}", abs_path.display());
+    format!("\x1b]8;;{uri}\x07{display_name}\x1b]8;;\x07")
+}
+
+/// Format an import chain as a "→"-separated string with clickable filenames.
+fn format_import_chain(chain: &[PathBuf], project_root: &Path) -> String {
+    chain
+        .iter()
+        .map(|p| {
+            let abs_path = if p.is_absolute() {
+                p.clone()
+            } else {
+                project_root.join(p)
+            };
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("?");
+            terminal_hyperlink(&abs_path, name)
+        })
+        .collect::<Vec<_>>()
+        .join(" → ")
+}
+
+/// Render a single hazard source line from the hazardous module.
+fn render_hazard_source(gutter: &str, hs: &HazardSource, project_root: &Path) {
+    if hs.span.start == 0 {
+        // No valid span — show message only
+        println!(
+            " {gutter}    {}",
+            hs.message.if_supports_color(Stdout, |s| s.dimmed()),
+        );
+        return;
+    }
+
+    let source = match std::fs::read_to_string(&hs.file_path) {
+        Ok(s) => s,
+        Err(_) => {
+            println!(
+                " {gutter}    {}",
+                hs.message.if_supports_color(Stdout, |s| s.dimmed()),
+            );
+            return;
+        }
+    };
+
+    let (line, col, line_start, line_end) = offset_to_location(&source, hs.span.start);
+    let raw_line = get_source_line(&source, line_start, line_end);
+    let display_line = raw_line.replace('\t', "    ");
+    let display_col = compute_display_col(raw_line, col);
+
+    let span_len = (hs.span.end - hs.span.start) as usize;
+    let raw_end_on_line = (col - 1 + span_len).min(raw_line.len());
+    let underline_display_len =
+        compute_display_col(raw_line, raw_end_on_line + 1) - display_col;
+    let underline_len = underline_display_len.max(1);
+
+    let rel = pathdiff::diff_paths(&hs.file_path, project_root)
+        .unwrap_or_else(|| hs.file_path.clone());
+    let file_label = format!("{}:{}", rel.display(), line);
+
+    // File:line label
+    println!(
+        " {gutter}    {}",
+        file_label.if_supports_color(Stdout, |s| s.dimmed()),
+    );
+
+    // Source line
+    println!(
+        " {gutter}    {line_num} {sep} {code}",
+        line_num = format!("{line}").if_supports_color(Stdout, |s| s.cyan()),
+        sep = "│".if_supports_color(Stdout, |s| s.dimmed()),
+        code = display_line,
+    );
+
+    // Underline + hazard message
+    let underline = "~".repeat(underline_len);
+    let annotation = format!(
+        "{spaces}{underline} {msg}",
+        spaces = " ".repeat(display_col - 1),
+        msg = hs.message,
+    );
+    println!(
+        " {gutter}      {sep} {annotation}",
+        sep = "│".if_supports_color(Stdout, |s| s.dimmed()),
+        annotation = annotation
+            .if_supports_color(Stdout, |s| s.red())
+            .to_string(),
+    );
 }
 
 /// Apply color based on severity.

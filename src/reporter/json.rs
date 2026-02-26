@@ -28,6 +28,18 @@ struct JsonDiagnostic {
     line: Option<usize>,
     column: Option<usize>,
     help: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    import_chain: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    hazard_sources: Vec<JsonHazardSource>,
+}
+
+#[derive(Serialize)]
+struct JsonHazardSource {
+    file: String,
+    line: Option<usize>,
+    column: Option<usize>,
+    message: String,
 }
 
 impl Reporter for JsonReporter {
@@ -48,6 +60,36 @@ impl Reporter for JsonReporter {
                     (None, None)
                 };
 
+                let import_chain = d.import_chain.as_ref().map(|chain| {
+                    chain
+                        .iter()
+                        .map(|p| {
+                            p.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("?")
+                                .to_string()
+                        })
+                        .collect()
+                });
+
+                let hazard_sources: Vec<JsonHazardSource> = d.hazard_sources.iter().map(|hs| {
+                    let hs_rel = pathdiff::diff_paths(&hs.file_path, &self.project_root)
+                        .unwrap_or_else(|| hs.file_path.clone());
+                    let (hs_line, hs_col) = if hs.span.start > 0 {
+                        let src = std::fs::read_to_string(&hs.file_path).unwrap_or_default();
+                        let (l, c, _, _) = offset_to_location(&src, hs.span.start);
+                        (Some(l), Some(c))
+                    } else {
+                        (None, None)
+                    };
+                    JsonHazardSource {
+                        file: hs_rel.to_string_lossy().to_string(),
+                        line: hs_line,
+                        column: hs_col,
+                        message: hs.message.clone(),
+                    }
+                }).collect();
+
                 JsonDiagnostic {
                     rule: d.rule_name.clone(),
                     severity: d.severity.to_string(),
@@ -56,6 +98,8 @@ impl Reporter for JsonReporter {
                     line,
                     column,
                     help: d.help.clone(),
+                    import_chain,
+                    hazard_sources,
                 }
             })
             .collect();

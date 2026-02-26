@@ -112,6 +112,65 @@ impl ModuleGraph {
         visited
     }
 
+    /// Find shortest path that doesn't traverse fully-mocked modules.
+    /// Same BFS as `shortest_path` but skips fully-mocked intermediates
+    /// (mirrors `effective_subgraph` logic).
+    pub fn shortest_unmocked_path(
+        &self,
+        source: &Path,
+        target: &Path,
+        mocks: &[MockDeclaration],
+    ) -> Option<Vec<PathBuf>> {
+        if source == target {
+            return Some(vec![source.to_path_buf()]);
+        }
+
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        let mut parent: HashMap<PathBuf, PathBuf> = HashMap::new();
+
+        queue.push_back(source.to_path_buf());
+        visited.insert(source.to_path_buf());
+
+        while let Some(current) = queue.pop_front() {
+            for edge in self.outgoing_edges(&current) {
+                if edge.is_type_only {
+                    continue;
+                }
+                let next = &edge.target;
+
+                // Skip fully-mocked intermediates (but allow target itself)
+                if next != target {
+                    let is_fully_mocked = mocks.iter().any(|m| {
+                        m.kind == MockKind::Full
+                            && m.resolved_path.as_deref() == Some(next.as_path())
+                    });
+                    if is_fully_mocked {
+                        continue;
+                    }
+                }
+
+                if !visited.contains(next) {
+                    visited.insert(next.clone());
+                    parent.insert(next.clone(), current.clone());
+                    if next == target {
+                        let mut path = vec![target.to_path_buf()];
+                        let mut cur = target;
+                        while let Some(p) = parent.get(cur) {
+                            path.push(p.clone());
+                            cur = p;
+                        }
+                        path.reverse();
+                        return Some(path);
+                    }
+                    queue.push_back(next.clone());
+                }
+            }
+        }
+
+        None
+    }
+
     /// Find shortest path from source to target using BFS.
     pub fn shortest_path(&self, source: &Path, target: &Path) -> Option<Vec<PathBuf>> {
         if source == target {
