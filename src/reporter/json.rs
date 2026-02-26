@@ -16,6 +16,7 @@ struct JsonReport {
     files_checked: usize,
     files_passed: usize,
     files_failed: usize,
+    fixable_count: usize,
     diagnostics: Vec<JsonDiagnostic>,
 }
 
@@ -28,6 +29,7 @@ struct JsonDiagnostic {
     line: Option<usize>,
     column: Option<usize>,
     help: Option<String>,
+    fixable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     import_chain: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -98,6 +100,7 @@ impl Reporter for JsonReporter {
                     line,
                     column,
                     help: d.help.clone(),
+                    fixable: d.fix.is_some(),
                     import_chain,
                     hazard_sources,
                 }
@@ -111,12 +114,19 @@ impl Reporter for JsonReporter {
                 .to_string()
         });
 
+        let fixable_count = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity != Severity::Off && d.fix.is_some())
+            .count();
+
         let report = JsonReport {
             version: "0.1.0".to_string(),
             tsconfig,
             files_checked: result.files_checked,
             files_passed: result.files_passed,
             files_failed: result.files_failed,
+            fixable_count,
             diagnostics,
         };
 

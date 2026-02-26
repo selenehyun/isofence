@@ -11,6 +11,7 @@ pub struct ConsoleReporter {
     pub project_root: std::path::PathBuf,
     pub quiet: bool,
     pub show_all: bool,
+    pub fix_applied: bool,
 }
 
 /// Max number of files shown before truncation (unless --all).
@@ -152,6 +153,26 @@ impl Reporter for ConsoleReporter {
                 .collect();
             println!("  {}", parts.join(", "));
         }
+
+        // Fix suggestion
+        let fixable_count = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity != Severity::Off && d.fix.is_some())
+            .count();
+
+        if fixable_count > 0 && !self.fix_applied {
+            println!();
+            println!(
+                "  {} {} issue(s) can be auto-fixed. Run `isofence --fix` to apply.",
+                "🔧", fixable_count,
+            );
+            println!(
+                "     {}",
+                "isofence inserts mock declarations only — run your formatter afterward."
+                    .if_supports_color(Stdout, |s| s.dimmed()),
+            );
+        }
     }
 }
 
@@ -188,8 +209,9 @@ fn render_source_context(source: &str, d: &Diagnostic, line_width: usize) {
 
     // Underline + rule name
     let underline = "~".repeat(underline_len);
+    let fix_badge = if d.fix.is_some() { " (fix)" } else { "" };
     let annotation = format!(
-        "{spaces}{underline} {rule}",
+        "{spaces}{underline} {rule}{fix_badge}",
         spaces = " ".repeat(display_col - 1),
         underline = underline,
         rule = d.rule_name,
@@ -219,11 +241,13 @@ fn render_fallback(d: &Diagnostic, line_width: usize, project_root: &Path) {
         Severity::Warning => color_by_severity("⚠", Severity::Warning),
         Severity::Off => return,
     };
+    let fix_badge = if d.fix.is_some() { " (fix)" } else { "" };
+    let rule_display = format!("{}{}", d.rule_name, fix_badge);
     println!(
         " {gutter}  {icon} {rule}: {msg}",
         gutter = gutter,
         icon = icon,
-        rule = color_by_severity(&d.rule_name, d.severity),
+        rule = color_by_severity(&rule_display, d.severity),
         msg = d.message,
     );
 

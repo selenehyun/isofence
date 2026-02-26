@@ -199,6 +199,7 @@ fn main() {
             project_root: project_root.clone(),
             quiet: config.quiet,
             show_all: cli.all,
+            fix_applied: config.fix,
         }),
     };
 
