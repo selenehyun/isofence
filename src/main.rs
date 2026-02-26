@@ -8,6 +8,7 @@ use isofence::config::{Config, OutputFormat};
 use isofence::engine::context::is_test_file_path;
 use isofence::engine::Engine;
 use isofence::fix;
+use isofence::progress::create_progress;
 use isofence::reporter::console::ConsoleReporter;
 use isofence::reporter::json::JsonReporter;
 use isofence::reporter::Reporter;
@@ -134,8 +135,10 @@ fn main() {
     }
 
     // Run engine
+    let quiet = config.quiet || config.format == OutputFormat::Json;
+    let progress = create_progress(quiet);
     let engine = Engine::new(config.clone(), registry);
-    let result = engine.run(&test_files, &source_files);
+    let result = engine.run(&test_files, &source_files, &*progress);
 
     // Apply fixes if requested
     if config.fix {

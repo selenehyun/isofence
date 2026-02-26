@@ -17,6 +17,7 @@ use crate::engine::graph::ModuleGraph;
 use crate::engine::parser::{
     extract_imports, extract_mocks, extract_safe_signals, parse_source,
 };
+use crate::progress::{Progress, SilentProgress};
 use crate::rule::registry::RuleRegistry;
 use crate::rule::{Diagnostic, Fix, Hazard, HazardCategory, Severity};
 
@@ -40,12 +41,19 @@ impl Engine {
     }
 
     /// Run the full analysis pipeline.
-    pub fn run(&self, test_files: &[PathBuf], all_source_files: &[PathBuf]) -> EngineResult {
+    pub fn run(&self, test_files: &[PathBuf], all_source_files: &[PathBuf], progress: &dyn Progress) -> EngineResult {
         // Phase 1 & 2: Per-file analysis (parallel)
+        let total = (test_files.len() + all_source_files.len()) as u64;
+        progress.start_file_analysis(total);
+
         let per_file_results: Vec<FileAnalysisResult> = test_files
             .par_iter()
             .chain(all_source_files.par_iter())
-            .filter_map(|file_path| self.analyze_file(file_path))
+            .filter_map(|file_path| {
+                let result = self.analyze_file(file_path);
+                progress.file_analyzed();
+                result
+            })
             .collect();
 
         // Collect results
@@ -70,9 +78,11 @@ impl Engine {
         module_hazards.retain(|path, _| !self.config.is_allowed(path));
 
         // Phase 3: Graph analysis
+        progress.start_graph_phase();
         let graph = self.build_graph(&per_file_results, &all_imports);
 
         // Build mock registry from all test contexts (filtered by allowlist)
+        progress.graph_step("Building mock registry...");
         let mut mock_registry = self.build_mock_registry(&test_contexts);
         mock_registry.retain(|path, _| !self.config.is_allowed(path));
 
@@ -84,11 +94,13 @@ impl Engine {
         };
 
         // Run graph-level rules (e.g., mock-consensus)
+        progress.graph_step("Running graph rules...");
         let graph_diagnostics = self.run_graph_rules(&graph_ctx);
         all_diagnostics.extend(graph_diagnostics);
 
         // Hazard reachability: for each test file, find unmocked hazardous modules
-        let reachability_diagnostics = self.run_hazard_reachability(&graph_ctx);
+        progress.start_reachability(graph_ctx.test_contexts.len() as u64);
+        let reachability_diagnostics = self.run_hazard_reachability(&graph_ctx, progress);
         all_diagnostics.extend(reachability_diagnostics);
 
         // Sort and deduplicate
@@ -113,12 +125,19 @@ impl Engine {
         let files_failed = files_with_issues.len();
         let files_passed = files_checked.saturating_sub(files_failed);
 
+        progress.finish();
+
         EngineResult {
             diagnostics: all_diagnostics,
             files_checked,
             files_passed,
             files_failed,
         }
+    }
+
+    /// Run the full analysis pipeline with no progress output.
+    pub fn run_silent(&self, test_files: &[PathBuf], source_files: &[PathBuf]) -> EngineResult {
+        self.run(test_files, source_files, &SilentProgress)
     }
 
     /// Analyze a single file (Phase 1 & 2).
@@ -336,11 +355,12 @@ impl Engine {
     }
 
     /// Hazard reachability: for each test file, find hazardous modules in the effective subgraph.
-    fn run_hazard_reachability(&self, ctx: &GraphContext) -> Vec<Diagnostic> {
+    fn run_hazard_reachability(&self, ctx: &GraphContext, progress: &dyn Progress) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
         for (test_file, test_ctx) in &ctx.test_contexts {
             let effective = ctx.graph.effective_subgraph(test_file, &test_ctx.mocks);
+            progress.reachability_step();
 
             for module_path in &effective {
                 if module_path == test_file {
