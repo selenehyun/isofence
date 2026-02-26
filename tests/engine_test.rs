@@ -321,3 +321,75 @@ mod graph {
         assert!(subgraph.contains(&path("/shared.ts")));
     }
 }
+
+// ---- Integration Tests ----
+
+mod integration {
+    use isofence::config::Config;
+    use isofence::engine::context::is_test_file_path;
+    use isofence::engine::Engine;
+    use isofence::rule::registry::RuleRegistry;
+    use isofence::rules::all_builtin_rules;
+    use tempfile::tempdir;
+
+    #[test]
+    fn source_file_diagnostics_excluded_from_output() {
+        let dir = tempdir().unwrap();
+
+        // Source file with a hazard (mutable-module-var)
+        let source_path = dir.path().join("counter.ts");
+        std::fs::write(&source_path, "let counter = 0;\n").unwrap();
+
+        let config = Config::load(dir.path().to_path_buf());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[], &[source_path]);
+
+        // Source file diagnostics should be internal only — not in final output
+        assert!(
+            result.diagnostics.is_empty(),
+            "Expected no diagnostics (source file diagnostics should be internal), got: {:?}",
+            result.diagnostics.iter()
+                .map(|d| format!("[{}] {}: {}", d.file_path.display(), d.rule_name, d.message))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn diagnostics_only_on_test_files() {
+        let dir = tempdir().unwrap();
+
+        // Source file with hazards
+        let source_path = dir.path().join("service.ts");
+        std::fs::write(&source_path, "let state = 0;\nconst cache = new Map();\n").unwrap();
+
+        // Test file
+        let test_path = dir.path().join("app.test.ts");
+        std::fs::write(&test_path, "import './service';\n").unwrap();
+
+        let config = Config::load(dir.path().to_path_buf());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &[source_path]);
+
+        // All diagnostics must be on test files
+        for d in &result.diagnostics {
+            assert!(
+                is_test_file_path(&d.file_path),
+                "Expected diagnostics only on test files, found on '{}': [{}] {}",
+                d.file_path.display(), d.rule_name, d.message,
+            );
+        }
+
+        // files_failed must not exceed files_checked
+        assert!(
+            result.files_failed <= result.files_checked,
+            "files_failed ({}) should not exceed files_checked ({})",
+            result.files_failed, result.files_checked,
+        );
+    }
+}

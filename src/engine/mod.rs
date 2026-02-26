@@ -64,7 +64,9 @@ impl Engine {
             HashMap::new();
 
         for result in &per_file_results {
-            all_diagnostics.extend(result.diagnostics.clone());
+            if result.test_context.is_some() {
+                all_diagnostics.extend(result.diagnostics.clone());
+            }
             if !result.hazards.is_empty() {
                 module_hazards.insert(result.file_path.clone(), result.hazards.clone());
             }
