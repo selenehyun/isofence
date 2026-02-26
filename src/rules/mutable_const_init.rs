@@ -99,9 +99,20 @@ impl Rule for MutableConstInit {
 
             if is_mutable_const_init(init) {
                 let kind = describe_mutable_init(init);
+                // Call/New expressions that survived is_safe_const_init are likely
+                // still safe (factory returns, wrappers) — downgrade to Warning.
+                let severity = match init {
+                    Expression::ObjectExpression(_) | Expression::ArrayExpression(_) => {
+                        Severity::Error
+                    }
+                    Expression::CallExpression(_) | Expression::NewExpression(_) => {
+                        Severity::Warning
+                    }
+                    _ => Severity::Error,
+                };
                 diagnostics.push(Diagnostic {
                     rule_name: "mutable-const-init".to_string(),
-                    severity: Severity::Error,
+                    severity,
                     message: format!(
                         "`const {name}` — {kind} initializer is mutable despite const binding"
                     ),

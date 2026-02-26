@@ -11,6 +11,8 @@ pub struct JsonReporter {
 #[derive(Serialize)]
 struct JsonReport {
     version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tsconfig: Option<String>,
     files_checked: usize,
     files_passed: usize,
     files_failed: usize,
@@ -58,8 +60,16 @@ impl Reporter for JsonReporter {
             })
             .collect();
 
+        let tsconfig = result.tsconfig_path.as_ref().map(|p| {
+            pathdiff::diff_paths(p, &self.project_root)
+                .unwrap_or_else(|| p.clone())
+                .to_string_lossy()
+                .to_string()
+        });
+
         let report = JsonReport {
             version: "0.1.0".to_string(),
+            tsconfig,
             files_checked: result.files_checked,
             files_passed: result.files_passed,
             files_failed: result.files_failed,

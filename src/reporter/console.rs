@@ -23,6 +23,16 @@ impl Reporter for ConsoleReporter {
             "isofence v0.1.0"
                 .if_supports_color(Stdout, |s| s.bold())
         );
+        if let Some(ref tsconfig) = result.tsconfig_path {
+            let rel = pathdiff::diff_paths(tsconfig, &self.project_root)
+                .unwrap_or_else(|| tsconfig.clone());
+            println!(
+                "  tsconfig: {}",
+                rel.display()
+                    .to_string()
+                    .if_supports_color(Stdout, |s| s.dimmed()),
+            );
+        }
         println!();
 
         // Group diagnostics by file

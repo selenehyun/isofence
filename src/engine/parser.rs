@@ -1,6 +1,7 @@
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, BindingPatternKind, CallExpression, Expression, Program, Statement,
+    Argument, ArrayExpressionElement, BindingPatternKind, CallExpression, Expression, Program,
+    Statement,
 };
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::SourceType;
@@ -278,12 +279,126 @@ fn is_const_type_ref(ty: &oxc_ast::ast::TSType<'_>) -> bool {
     })
 }
 
+/// Arrow function or function expression — always immutable.
+pub fn is_function_value(expr: &Expression<'_>) -> bool {
+    matches!(
+        expr,
+        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
+    )
+}
+
+/// Check if an array element is a safe leaf value (primitive, identifier, or member access).
+fn is_safe_array_element(elem: &ArrayExpressionElement<'_>) -> bool {
+    matches!(
+        elem,
+        ArrayExpressionElement::Elision(_)
+            | ArrayExpressionElement::StringLiteral(_)
+            | ArrayExpressionElement::NumericLiteral(_)
+            | ArrayExpressionElement::BooleanLiteral(_)
+            | ArrayExpressionElement::NullLiteral(_)
+            | ArrayExpressionElement::TemplateLiteral(_)
+            | ArrayExpressionElement::Identifier(_)
+            | ArrayExpressionElement::StaticMemberExpression(_)
+            | ArrayExpressionElement::ComputedMemberExpression(_)
+            | ArrayExpressionElement::UnaryExpression(_)
+    )
+}
+
+/// Non-empty array containing only primitive literals, identifiers, and member expressions.
+/// e.g. `['PAID', 'UNPAID']`, `[Status.PAID, Status.UNPAID]`, `[1, 2, 3]`
+/// Empty arrays `[]` are still mutable containers and NOT considered safe.
+pub fn is_literal_only_array(expr: &Expression<'_>) -> bool {
+    if let Expression::ArrayExpression(arr) = expr {
+        return !arr.elements.is_empty()
+            && arr.elements.iter().all(|elem| is_safe_array_element(elem));
+    }
+    false
+}
+
+/// Schema builder call — z.object(), z.string(), Joi.object(), yup.object(), etc.
+/// These return immutable schema descriptors.
+pub fn is_schema_builder_call(expr: &Expression<'_>) -> bool {
+    // Walk through method chains: z.object({...}).optional().default(...)
+    let root_call = unwrap_chain(expr);
+    if let Expression::CallExpression(call) = root_call {
+        if let Expression::StaticMemberExpression(member) = &call.callee {
+            if let Expression::Identifier(obj) = &member.object {
+                return matches!(
+                    obj.name.as_str(),
+                    "z" | "zod" | "Joi" | "joi" | "yup" | "Yup"
+                );
+            }
+        }
+    }
+    false
+}
+
+/// Unwrap method chains to find the root call expression.
+/// e.g. `z.object({}).optional()` → `z.object({})`
+fn unwrap_chain<'a>(expr: &'a Expression<'a>) -> &'a Expression<'a> {
+    if let Expression::CallExpression(call) = expr {
+        if let Expression::StaticMemberExpression(member) = &call.callee {
+            if let Expression::CallExpression(_) = &member.object {
+                return unwrap_chain(&member.object);
+            }
+        }
+    }
+    expr
+}
+
+/// Symbol() or Symbol.for() — always unique and immutable.
+pub fn is_symbol_call(expr: &Expression<'_>) -> bool {
+    if let Expression::CallExpression(call) = expr {
+        match &call.callee {
+            Expression::Identifier(id) if id.name.as_str() == "Symbol" => return true,
+            Expression::StaticMemberExpression(member) => {
+                if let Expression::Identifier(obj) = &member.object {
+                    return obj.name.as_str() == "Symbol";
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// DI token constructors — `new Token(...)`, `new InjectionToken(...)`.
+/// These are marker objects used for dependency injection, effectively immutable.
+pub fn is_safe_constructor(expr: &Expression<'_>) -> bool {
+    if let Expression::NewExpression(new_expr) = expr {
+        if let Expression::Identifier(id) = &new_expr.callee {
+            return matches!(
+                id.name.as_str(),
+                "Token" | "InjectionToken" | "OpaqueToken"
+            );
+        }
+    }
+    false
+}
+
+/// Identifier or member expression reference — doesn't create new mutable state,
+/// just aliases an existing binding. The referenced value's mutability is checked
+/// separately by rules on its declaration.
+pub fn is_reference_value(expr: &Expression<'_>) -> bool {
+    matches!(
+        expr,
+        Expression::Identifier(_)
+            | Expression::StaticMemberExpression(_)
+            | Expression::ComputedMemberExpression(_)
+    )
+}
+
 /// Check if an expression is a "safe" const initializer.
 pub fn is_safe_const_init(expr: &Expression<'_>) -> bool {
     is_primitive_literal(expr)
         || is_undefined(expr)
         || is_object_freeze(expr)
         || is_as_const(expr)
+        || is_function_value(expr)
+        || is_literal_only_array(expr)
+        || is_schema_builder_call(expr)
+        || is_symbol_call(expr)
+        || is_safe_constructor(expr)
 }
 
 /// Check if an expression is a mutable const initializer.

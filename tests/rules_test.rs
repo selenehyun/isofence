@@ -209,6 +209,86 @@ mod mutable_const_init {
         // It's treated as a primitive-like value
         assert!(check("const RE = /pattern/i;").is_empty());
     }
+
+    #[test]
+    fn ignores_arrow_function() {
+        assert!(check("const fmt = (x: number) => x.toFixed(2);").is_empty());
+    }
+
+    #[test]
+    fn ignores_function_expression() {
+        assert!(check("const greet = function(name: string) { return `Hi ${name}`; };").is_empty());
+    }
+
+    #[test]
+    fn ignores_literal_only_array() {
+        assert!(check("const STATUSES = ['PAID', 'UNPAID', 'PENDING'];").is_empty());
+    }
+
+    #[test]
+    fn ignores_numeric_array() {
+        assert!(check("const CODES = [200, 201, 204, 404, 500];").is_empty());
+    }
+
+    #[test]
+    fn ignores_enum_member_array() {
+        assert!(check("const ACTIVE = [Status.PAID, Status.UNPAID];").is_empty());
+    }
+
+    #[test]
+    fn ignores_zod_schema() {
+        assert!(check("const Schema = z.object({ name: z.string() });").is_empty());
+    }
+
+    #[test]
+    fn ignores_zod_chain() {
+        assert!(check("const Schema = z.string().optional().default('');").is_empty());
+    }
+
+    #[test]
+    fn ignores_symbol_call() {
+        assert!(check("const MY_TOKEN = Symbol('MY_TOKEN');").is_empty());
+    }
+
+    #[test]
+    fn ignores_symbol_for() {
+        assert!(check("const KEY = Symbol.for('shared-key');").is_empty());
+    }
+
+    #[test]
+    fn ignores_di_token() {
+        assert!(check("const ACTOR_ID = new Token('ActorId');").is_empty());
+    }
+
+    #[test]
+    fn ignores_injection_token() {
+        assert!(check("const HTTP = new InjectionToken('HTTP');").is_empty());
+    }
+
+    #[test]
+    fn call_expr_severity_is_warning() {
+        // Call expressions that aren't recognized safe patterns → Warning, not Error
+        let rule = MutableConstInit;
+        let allocator = oxc_allocator::Allocator::default();
+        let file_path = std::path::PathBuf::from("test_module.ts");
+        let source = "const logger = createLogger();";
+        let result = isofence::engine::parser::parse_source(&allocator, source, &file_path);
+        let imports = isofence::engine::parser::extract_imports(&result.program);
+        let mut ctx = isofence::engine::context::ModuleContext::new(
+            file_path,
+            source.to_string(),
+            isofence::engine::context::TestFramework::Vitest,
+        );
+        ctx.imports = imports;
+
+        let mut diagnostics = Vec::new();
+        for stmt in &result.program.body {
+            diagnostics.extend(rule.check_module_item(stmt, &ctx));
+        }
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].severity, isofence::rule::Severity::Warning);
+    }
 }
 
 // ---- top-level-call ----
@@ -482,6 +562,37 @@ mod static_class_field {
     fn detects_exported_class() {
         let msgs = check("export class Registry { static data = []; }");
         assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn ignores_static_readonly_field() {
+        assert!(check("class Foo { static readonly items = [1, 2, 3]; }").is_empty());
+    }
+
+    #[test]
+    fn ignores_static_readonly_object() {
+        assert!(check("class Foo { static readonly config = { debug: false }; }").is_empty());
+    }
+
+    #[test]
+    fn ignores_static_arrow_function() {
+        assert!(check("class Foo { static format = (v: number) => v.toFixed(2); }").is_empty());
+    }
+
+    #[test]
+    fn ignores_static_literal_array() {
+        assert!(check("class Foo { static names = ['a', 'b', 'c']; }").is_empty());
+    }
+
+    #[test]
+    fn ignores_static_identifier_init() {
+        // Identifier reference to another binding — not creating new mutable state
+        assert!(check("class Foo { static allStatus = invoiceStatus; }").is_empty());
+    }
+
+    #[test]
+    fn ignores_static_member_expression_init() {
+        assert!(check("class Foo { static defaultType = ItemType.DEFAULT; }").is_empty());
     }
 }
 

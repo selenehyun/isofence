@@ -358,6 +358,67 @@ mod integration {
     }
 
     #[test]
+    fn hazard_reachability_dedup_preserves_distinct_modules() {
+        let dir = tempdir().unwrap();
+        // Canonicalize to avoid macOS /var vs /private/var symlink issues
+        let base = dir.path().canonicalize().unwrap();
+
+        // Two source files with different hazards
+        let source_a = base.join("module_a.ts");
+        std::fs::write(&source_a, "export let stateA = 0;\n").unwrap();
+
+        let source_b = base.join("module_b.ts");
+        std::fs::write(&source_b, "export let stateB = 0;\n").unwrap();
+
+        // Test file importing both hazardous modules
+        let test_path = base.join("multi.test.ts");
+        std::fs::write(
+            &test_path,
+            "import { stateA } from './module_a';\nimport { stateB } from './module_b';\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(
+            &[test_path],
+            &[source_a, source_b],
+        );
+
+        // Both hazardous modules should produce distinct diagnostics
+        let reachability_diags: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        // With dedup fix, we should see 2 separate diagnostics (one per module)
+        // Before the fix, they collapsed to 1 because span was identical (0..0)
+        assert!(
+            reachability_diags.len() >= 2,
+            "Expected at least 2 hazard-reachability diagnostics (one per hazardous module), got {}. All diags: {:?}",
+            reachability_diags.len(),
+            result.diagnostics.iter()
+                .map(|d| format!("[{}] {}: {}", d.rule_name, d.file_path.display(), d.message))
+                .collect::<Vec<_>>(),
+        );
+
+        // Verify they reference different modules
+        let messages: Vec<&str> = reachability_diags.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            messages.iter().any(|m| m.contains("module_a")),
+            "Should have diagnostic for module_a"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("module_b")),
+            "Should have diagnostic for module_b"
+        );
+    }
+
+    #[test]
     fn diagnostics_only_on_test_files() {
         let dir = tempdir().unwrap();
 

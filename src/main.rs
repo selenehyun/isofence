@@ -95,6 +95,24 @@ fn main() {
         config.tsconfig_path = Some(tsconfig);
     }
 
+    // Monorepo support: if tsconfig not found at project root, search CLI paths
+    if config.tsconfig_path.is_none() {
+        for path in &cli.paths {
+            let dir = if path.is_dir() {
+                path.clone()
+            } else {
+                path.parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_default()
+            };
+            let candidate = dir.join("tsconfig.json");
+            if candidate.exists() {
+                config.tsconfig_path = candidate.canonicalize().ok().or(Some(candidate));
+                break;
+            }
+        }
+    }
+
     config.format = match cli.format.as_str() {
         "json" => OutputFormat::Json,
         _ => OutputFormat::Console,

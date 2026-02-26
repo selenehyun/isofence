@@ -3,7 +3,7 @@ use oxc_ast::ast::{
 };
 
 use crate::engine::context::ModuleContext;
-use crate::engine::parser::{is_primitive_literal, is_safe_const_init, is_undefined};
+use crate::engine::parser::{is_primitive_literal, is_reference_value, is_safe_const_init, is_undefined};
 use crate::rule::{Diagnostic, HazardCategory, Rule, RuleMeta, Severity};
 
 /// Detects classes with static fields that have mutable initializers at module scope.
@@ -63,9 +63,18 @@ fn check_class_static_fields(class: &Class<'_>, ctx: &ModuleContext) -> Vec<Diag
                 continue;
             }
 
+            // readonly fields cannot be mutated via TypeScript
+            if prop.readonly {
+                continue;
+            }
+
             // Check if the initializer is mutable
             if let Some(init) = &prop.value {
-                if is_safe_const_init(init) || is_primitive_literal(init) || is_undefined(init) {
+                if is_safe_const_init(init)
+                    || is_primitive_literal(init)
+                    || is_undefined(init)
+                    || is_reference_value(init)
+                {
                     continue;
                 }
 

@@ -33,6 +33,7 @@ pub struct EngineResult {
     pub files_checked: usize,
     pub files_passed: usize,
     pub files_failed: usize,
+    pub tsconfig_path: Option<PathBuf>,
 }
 
 impl Engine {
@@ -110,11 +111,13 @@ impl Engine {
             a.file_path
                 .cmp(&b.file_path)
                 .then_with(|| a.span.start.cmp(&b.span.start))
+                .then_with(|| a.message.cmp(&b.message))
         });
         all_diagnostics.dedup_by(|a, b| {
             a.file_path == b.file_path
                 && a.span == b.span
                 && a.rule_name == b.rule_name
+                && a.message == b.message
         });
 
         // Count results
@@ -134,6 +137,7 @@ impl Engine {
             files_checked,
             files_passed,
             files_failed,
+            tsconfig_path: self.config.tsconfig_path.clone(),
         }
     }
 
@@ -196,8 +200,13 @@ impl Engine {
         }
 
         // Collect hazards from diagnostics (for non-test source files)
+        // Only Error-severity diagnostics become hazards — Warning-level findings
+        // (e.g., call/new expressions) don't trigger hazard-reachability errors.
         if !ctx.is_test_file {
             for d in &diagnostics {
+                if d.severity != Severity::Error {
+                    continue;
+                }
                 hazards.push(Hazard {
                     rule_name: d.rule_name.clone(),
                     category: HazardCategory::MutableState, // simplified for now
