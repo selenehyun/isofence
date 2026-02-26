@@ -81,6 +81,7 @@ impl Rule for MockConsensus {
                             }),
                             import_chain: None,
                             hazard_sources: vec![],
+                            hazardous_imports: vec![],
                         });
                     }
                 }

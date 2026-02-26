@@ -14,12 +14,16 @@ use crate::engine::context::{
     EdgeKind, GraphContext, MockKind, ModuleContext, TestContextSummary,
 };
 use crate::engine::graph::ModuleGraph;
+use crate::engine::context::ExportAnalysis;
 use crate::engine::parser::{
-    extract_imports, extract_mocks, extract_safe_signals, parse_source,
+    analyze_export_mutation, collect_module_mutable_bindings, extract_exports, extract_imports,
+    extract_mocks, extract_safe_signals, parse_source,
 };
 use crate::progress::{Progress, SilentProgress};
 use crate::rule::registry::RuleRegistry;
 use crate::rule::{Diagnostic, Fix, Hazard, HazardCategory, HazardSource, Severity};
+
+use std::collections::BTreeSet;
 
 /// The main analysis engine.
 pub struct Engine {
@@ -63,6 +67,7 @@ impl Engine {
         let mut test_contexts: HashMap<PathBuf, TestContextSummary> = HashMap::new();
         let mut all_imports: HashMap<PathBuf, Vec<crate::engine::context::ImportInfo>> =
             HashMap::new();
+        let mut export_analyses: HashMap<PathBuf, Vec<ExportAnalysis>> = HashMap::new();
 
         for result in &per_file_results {
             if result.test_context.is_some() {
@@ -75,6 +80,9 @@ impl Engine {
                 test_contexts.insert(result.file_path.clone(), ctx.clone());
             }
             all_imports.insert(result.file_path.clone(), result.imports.clone());
+            if !result.export_analyses.is_empty() {
+                export_analyses.insert(result.file_path.clone(), result.export_analyses.clone());
+            }
         }
 
         // Apply allowlist: remove allowed modules from hazards and diagnostics
@@ -86,7 +94,7 @@ impl Engine {
 
         // Phase 3: Graph analysis
         progress.start_graph_phase();
-        let graph = self.build_graph(&per_file_results, &all_imports, &resolver);
+        let graph = self.build_graph(&per_file_results, &mut all_imports, &resolver);
 
         // Build mock registry from all test contexts (filtered by allowlist)
         progress.graph_step("Building mock registry...");
@@ -98,6 +106,8 @@ impl Engine {
             mock_registry,
             module_hazards,
             test_contexts,
+            export_analyses,
+            all_imports,
         };
 
         // Run graph-level rules (e.g., mock-consensus)
@@ -206,19 +216,85 @@ impl Engine {
         // Collect hazards from diagnostics (for non-test source files)
         // Only Error-severity diagnostics become hazards — Warning-level findings
         // (e.g., call/new expressions) don't trigger hazard-reachability errors.
+        let mut export_analyses = Vec::new();
         if !ctx.is_test_file {
+            // Build rule name → category mapping from registry
+            let rule_categories: HashMap<&str, HazardCategory> = self.registry
+                .enabled_rules()
+                .iter()
+                .map(|r| {
+                    let meta = r.meta();
+                    (meta.name, meta.category)
+                })
+                .collect();
+
             for d in &diagnostics {
                 if d.severity != Severity::Error {
                     continue;
                 }
                 hazards.push(Hazard {
                     rule_name: d.rule_name.clone(),
-                    category: HazardCategory::MutableState, // simplified for now
+                    category: rule_categories.get(d.rule_name.as_str())
+                        .cloned()
+                        .unwrap_or(HazardCategory::MutableState),
                     confidence: crate::rule::Confidence::Definite,
                     span: d.span,
                     message: d.message.clone(),
+                    associated_export: None,
                 });
             }
+
+            // Export-level mutation analysis
+            let exports = extract_exports(program);
+            let mutable_bindings = collect_module_mutable_bindings(program);
+            export_analyses = analyze_export_mutation(program, &exports, &mutable_bindings);
+
+            // Associate hazards with exports
+            for hazard in &mut hazards {
+                for analysis in &export_analyses {
+                    if analysis.entry.local_name == analysis.entry.exported_name {
+                        // Direct export: check if hazard binding matches
+                        if analysis
+                            .referenced_bindings
+                            .contains(&analysis.entry.local_name)
+                            || mutable_bindings.contains(&analysis.entry.local_name)
+                        {
+                            if hazard.message.contains(&analysis.entry.local_name) {
+                                hazard.associated_export =
+                                    Some(analysis.entry.exported_name.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Filter out non-exported mutable-const-init hazards.
+            // A non-exported mutable const can't be accessed by importers directly.
+            // If it's referenced by an exported function, the export analysis already
+            // captures that via MutationImpact::Mutating/Reading on those exports.
+            let exported_names: std::collections::HashSet<&str> = exports
+                .iter()
+                .map(|e| e.local_name.as_str())
+                .collect();
+            let export_referenced: std::collections::HashSet<&str> = export_analyses
+                .iter()
+                .flat_map(|a| a.referenced_bindings.iter().map(|s| s.as_str()))
+                .collect();
+            hazards.retain(|h| {
+                if h.rule_name != "mutable-const-init" {
+                    return true;
+                }
+                // Check if the hazard's binding is exported or referenced by an export.
+                // Extract binding name from message: "`const NAME` — ..."
+                if let Some(name) = h.message.strip_prefix("`const ")
+                    .and_then(|s| s.split('`').next())
+                {
+                    exported_names.contains(name) || export_referenced.contains(name)
+                } else {
+                    true // keep if we can't parse the name (e.g., export default)
+                }
+            });
         }
 
         let test_context = if ctx.is_test_file {
@@ -238,14 +314,16 @@ impl Engine {
             hazards,
             imports: ctx.imports,
             test_context,
+            export_analyses,
         })
     }
 
     /// Build the module graph from analyzed files.
+    /// Also resolves import paths in `all_imports` for specifier matching.
     fn build_graph(
         &self,
         results: &[FileAnalysisResult],
-        all_imports: &HashMap<PathBuf, Vec<crate::engine::context::ImportInfo>>,
+        all_imports: &mut HashMap<PathBuf, Vec<crate::engine::context::ImportInfo>>,
         resolver: &Resolver,
     ) -> ModuleGraph {
         let mut graph = ModuleGraph::new();
@@ -260,7 +338,10 @@ impl Engine {
         }
 
         // Resolve imports and add edges
-        for (file_path, imports) in all_imports {
+        // Collect resolved paths to update ImportInfo afterward
+        let mut resolved_updates: Vec<(PathBuf, String, PathBuf)> = Vec::new();
+
+        for (file_path, imports) in all_imports.iter() {
             let dir = file_path.parent().unwrap_or(Path::new("."));
             for import in imports {
                 // Skip node builtins and bare specifiers from node_modules
@@ -283,10 +364,15 @@ impl Engine {
                         };
                         graph.add_edge(
                             file_path.clone(),
-                            resolved_path,
+                            resolved_path.clone(),
                             kind,
                             import.is_type_only,
                         );
+                        resolved_updates.push((
+                            file_path.clone(),
+                            import.source.clone(),
+                            resolved_path,
+                        ));
                     }
                     continue;
                 }
@@ -305,13 +391,29 @@ impl Engine {
                         };
                         graph.add_edge(
                             file_path.clone(),
-                            resolved_path,
+                            resolved_path.clone(),
                             kind,
                             import.is_type_only,
                         );
+                        resolved_updates.push((
+                            file_path.clone(),
+                            import.source.clone(),
+                            resolved_path,
+                        ));
                     }
                     Err(_) => {
                         // Module not found — skip silently
+                    }
+                }
+            }
+        }
+
+        // Update ImportInfo with resolved paths
+        for (file_path, source, resolved_path) in resolved_updates {
+            if let Some(imports) = all_imports.get_mut(&file_path) {
+                for info in imports.iter_mut() {
+                    if info.source == source && info.resolved_path.is_none() {
+                        info.resolved_path = Some(resolved_path.clone());
                     }
                 }
             }
@@ -397,7 +499,13 @@ impl Engine {
     ///   Pass 1 — Classify each reachable hazard as direct (chain=2) or transitive (chain>=3).
     ///   Pass 2 — Direct hazards get `fix: Some(...)`, transitive hazards are grouped by
     ///            first-hop and emitted as a single Warning-level suggestion per group.
+    ///
+    /// Export-level filtering: if the hazardous module has export analysis data, only report
+    /// the diagnostic if the test imports Mutating/Reading/Unknown exports. Skip if only Safe.
     fn run_hazard_reachability(&self, ctx: &GraphContext, progress: &dyn Progress) -> Vec<Diagnostic> {
+        use crate::engine::context::MutationImpact;
+        use crate::rule::HazardousImport;
+
         let mut diagnostics = Vec::new();
 
         for (test_file, test_ctx) in &ctx.test_contexts {
@@ -409,6 +517,7 @@ impl Engine {
                 module_path: PathBuf,
                 chain: Option<Vec<PathBuf>>,
                 hazards: Vec<Hazard>,
+                hazardous_imports: Vec<HazardousImport>,
             }
 
             let mut direct_hazards: Vec<HazardEntry> = Vec::new();
@@ -437,10 +546,53 @@ impl Engine {
 
                     let chain_len = chain.as_ref().map_or(0, |c| c.len());
 
+                    // Export-level filtering for direct imports
+                    let mut hazardous_imports = Vec::new();
+                    if chain_len <= 2 {
+                        if let Some(analyses) = ctx.export_analyses.get(module_path) {
+                            // Get import specifiers from test → module
+                            let import_names =
+                                get_import_specifiers_for_module(&ctx.all_imports, test_file, module_path);
+
+                            if !import_names.is_empty() {
+                                let matched = filter_analyses_by_imports(&import_names, analyses);
+
+                                // Check if any matched export is unsafe
+                                let has_unsafe = matched.iter().any(|a| {
+                                    matches!(
+                                        a.impact,
+                                        MutationImpact::Mutating
+                                            | MutationImpact::Reading
+                                            | MutationImpact::Unknown
+                                    )
+                                });
+
+                                if !has_unsafe {
+                                    // All imported exports are safe → skip this diagnostic
+                                    continue;
+                                }
+
+                                // Build hazardous_imports detail
+                                for a in &matched {
+                                    if a.impact != MutationImpact::Safe {
+                                        hazardous_imports.push(HazardousImport {
+                                            symbol_name: a.entry.exported_name.clone(),
+                                            impact: a.impact.clone(),
+                                            referenced_bindings: a.referenced_bindings.clone(),
+                                        });
+                                    }
+                                }
+                            }
+                            // If import_names is empty (e.g., side-effect import),
+                            // fall through to standard diagnostic
+                        }
+                    }
+
                     let entry = HazardEntry {
                         module_path: module_path.clone(),
                         chain,
                         hazards: hazards.clone(),
+                        hazardous_imports,
                     };
 
                     if chain_len <= 2 {
@@ -467,6 +619,12 @@ impl Engine {
                     module_rel.display()
                 );
 
+                let help = if entry.hazardous_imports.is_empty() {
+                    "Mock this module to isolate your tests.".to_string()
+                } else {
+                    "Mock this module, or only import safe exports.".to_string()
+                };
+
                 let sources: Vec<HazardSource> = entry.hazards
                     .iter()
                     .take(3)
@@ -474,6 +632,7 @@ impl Engine {
                         file_path: entry.module_path.clone(),
                         span: h.span,
                         message: h.message.clone(),
+                        category: h.category.clone(),
                     })
                     .collect();
 
@@ -483,13 +642,14 @@ impl Engine {
                     message,
                     file_path: test_file.clone(),
                     span: oxc_span::Span::default(),
-                    help: Some("Mock this module to isolate your tests.".to_string()),
+                    help: Some(help),
                     fix: Some(Fix {
                         text: entry.module_path.to_string_lossy().to_string(),
                         span: oxc_span::Span::default(),
                     }),
                     import_chain: entry.chain,
                     hazard_sources: sources,
+                    hazardous_imports: entry.hazardous_imports,
                 });
             }
 
@@ -516,9 +676,35 @@ impl Engine {
                             file_path: e.module_path.clone(),
                             span: h.span,
                             message: h.message.clone(),
+                            category: h.category.clone(),
                         })
                     })
                     .collect();
+
+                let help = {
+                    let mut items: Vec<String> = entries.iter()
+                        .map(|e| {
+                            let rel = pathdiff::diff_paths(&e.module_path, &self.config.project_root)
+                                .unwrap_or_else(|| e.module_path.clone());
+                            let cats: BTreeSet<String> = e.hazards.iter()
+                                .map(|h| h.category.to_string())
+                                .collect();
+                            let cat_str = cats.into_iter().collect::<Vec<_>>().join(", ");
+                            format!("`{}` ({})", rel.display(), cat_str)
+                        })
+                        .collect();
+                    items.sort();
+                    items.dedup();
+                    if items.len() <= 3 {
+                        format!("Mock or allowlist: {}", items.join(", "))
+                    } else {
+                        let shown = items[..3].join(", ");
+                        let remaining = items.len() - 3;
+                        format!(
+                            "Mock or allowlist: {shown}, and {remaining} more (use --json for full list)"
+                        )
+                    }
+                };
 
                 diagnostics.push(Diagnostic {
                     rule_name: "hazard-reachability".to_string(),
@@ -526,13 +712,11 @@ impl Engine {
                     message,
                     file_path: test_file.clone(),
                     span: oxc_span::Span::default(),
-                    help: Some(format!(
-                        "Mock `{}` to block {count} transitive hazard(s), or add specific modules to your allowlist.",
-                        first_hop_rel.display()
-                    )),
+                    help: Some(help),
                     fix: None,
                     import_chain: representative_chain,
                     hazard_sources: sources,
+                    hazardous_imports: vec![],
                 });
             }
         }
@@ -558,6 +742,52 @@ impl Engine {
     }
 }
 
+/// Get import specifier names from `from` file importing `to` file.
+/// Merges multiple import declarations for the same target.
+fn get_import_specifiers_for_module(
+    all_imports: &HashMap<PathBuf, Vec<crate::engine::context::ImportInfo>>,
+    from: &Path,
+    to: &Path,
+) -> Vec<String> {
+    use crate::engine::context::ImportKind;
+
+    let mut names = Vec::new();
+    if let Some(imports) = all_imports.get(from) {
+        for info in imports.iter().filter(|i| i.resolved_path.as_deref() == Some(to)) {
+            match &info.kind {
+                ImportKind::Named(specs) => {
+                    names.extend(specs.iter().map(|s| s.imported_name.clone()));
+                }
+                ImportKind::Default(_) => names.push("default".to_string()),
+                ImportKind::Combined { named, .. } => {
+                    names.push("default".to_string());
+                    names.extend(named.iter().map(|s| s.imported_name.clone()));
+                }
+                ImportKind::Namespace(_) => return vec!["*".to_string()],
+                ImportKind::SideEffect => {} // No specifiers
+            }
+        }
+    }
+    names
+}
+
+/// Filter export analyses by the names actually imported.
+fn filter_analyses_by_imports<'a>(
+    import_names: &[String],
+    analyses: &'a [ExportAnalysis],
+) -> Vec<&'a ExportAnalysis> {
+    if import_names.iter().any(|n| n == "*") {
+        // Namespace import: all exports are accessible
+        return analyses.iter().collect();
+    }
+
+    let names: std::collections::HashSet<&str> = import_names.iter().map(|s| s.as_str()).collect();
+    analyses
+        .iter()
+        .filter(|a| names.contains(a.entry.exported_name.as_str()))
+        .collect()
+}
+
 /// Result from analyzing a single file.
 struct FileAnalysisResult {
     file_path: PathBuf,
@@ -565,4 +795,5 @@ struct FileAnalysisResult {
     hazards: Vec<Hazard>,
     imports: Vec<crate::engine::context::ImportInfo>,
     test_context: Option<TestContextSummary>,
+    export_analyses: Vec<ExportAnalysis>,
 }

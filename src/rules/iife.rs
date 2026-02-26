@@ -44,6 +44,7 @@ impl Rule for Iife {
                 fix: None,
                 import_chain: None,
                 hazard_sources: vec![],
+                hazardous_imports: vec![],
             }];
         }
 

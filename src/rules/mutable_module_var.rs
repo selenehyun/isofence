@@ -67,6 +67,7 @@ impl Rule for MutableModuleVar {
                     fix: None,
                     import_chain: None,
                     hazard_sources: vec![],
+                    hazardous_imports: vec![],
                 }
             })
             .collect()

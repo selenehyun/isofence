@@ -80,6 +80,7 @@ impl Rule for MutableConstInit {
                     fix: None,
                     import_chain: None,
                     hazard_sources: vec![],
+                    hazardous_imports: vec![],
                 });
                 continue;
             }
@@ -97,6 +98,7 @@ impl Rule for MutableConstInit {
                     fix: None,
                     import_chain: None,
                     hazard_sources: vec![],
+                    hazardous_imports: vec![],
                 });
                 continue;
             }
@@ -126,6 +128,7 @@ impl Rule for MutableConstInit {
                     fix: None,
                     import_chain: None,
                     hazard_sources: vec![],
+                    hazardous_imports: vec![],
                 });
             }
         }
@@ -157,6 +160,7 @@ impl MutableConstInit {
                 fix: None,
                 import_chain: None,
                 hazard_sources: vec![],
+                    hazardous_imports: vec![],
             }];
         }
 

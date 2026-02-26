@@ -1,9 +1,10 @@
 use isofence::engine::context::{
-    is_test_file_path, EdgeKind, MockDeclaration, MockKind, TestFramework,
+    is_test_file_path, EdgeKind, MockDeclaration, MockKind, MutationImpact, TestFramework,
 };
 use isofence::engine::graph::ModuleGraph;
 use isofence::engine::parser::{
-    extract_imports, extract_mocks, parse_source,
+    analyze_export_mutation, collect_module_mutable_bindings, extract_exports, extract_imports,
+    extract_mocks, parse_source,
 };
 use oxc_allocator::Allocator;
 use oxc_span::Span;
@@ -326,7 +327,7 @@ mod graph {
 
 mod integration {
     use isofence::config::Config;
-    use isofence::engine::context::is_test_file_path;
+    use isofence::engine::context::{is_test_file_path, MutationImpact};
     use isofence::engine::Engine;
     use isofence::rule::registry::RuleRegistry;
     use isofence::rules::all_builtin_rules;
@@ -703,6 +704,209 @@ mod integration {
     }
 
     #[test]
+    fn spread_config_object_not_hazardous() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // Source file with spread config — should NOT be hazardous
+        let config_path = base.join("config.ts");
+        std::fs::write(
+            &config_path,
+            "import { baseConfig } from './base';\nexport const writerConfig = { ...baseConfig, synchronize: true };\n",
+        )
+        .unwrap();
+
+        let base_path = base.join("base.ts");
+        std::fs::write(&base_path, "export const baseConfig = { type: 'mysql', port: 3306 };\n")
+            .unwrap();
+
+        // Test file imports config
+        let test_path = base.join("app.test.ts");
+        std::fs::write(
+            &test_path,
+            "import { writerConfig } from './config';\ntest('config', () => {});\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &[config_path, base_path]);
+
+        let reachability: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        assert!(
+            reachability.is_empty(),
+            "Spread config with primitives should not produce hazard-reachability diagnostics, got: {:?}",
+            reachability.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn transitive_hazard_help_references_hazardous_module() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // Hazardous module
+        let db_path = base.join("db.ts");
+        std::fs::write(&db_path, "export let connection = null;\n").unwrap();
+
+        // Clean first-hop
+        let service_path = base.join("service.ts");
+        std::fs::write(
+            &service_path,
+            "import { connection } from './db';\nexport function getConn() { return connection; }\n",
+        )
+        .unwrap();
+
+        // Test imports service
+        let test_path = base.join("app.test.ts");
+        std::fs::write(
+            &test_path,
+            "import { getConn } from './service';\ntest('conn', () => { getConn(); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &[service_path, db_path]);
+
+        let warnings: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability" && d.severity == isofence::rule::Severity::Warning)
+            .collect();
+
+        assert!(!warnings.is_empty(), "Expected transitive hazard warnings");
+
+        let help = warnings[0].help.as_ref().unwrap();
+        // Help should reference the hazardous module path, not the first-hop
+        assert!(
+            help.contains("db.ts"),
+            "Help should reference hazardous module 'db.ts', got: {help}"
+        );
+        // Should NOT reference first-hop in the old format
+        assert!(
+            !help.contains("Mock `service.ts` to block"),
+            "Help should NOT use old first-hop format, got: {help}"
+        );
+    }
+
+    #[test]
+    fn transitive_hazard_help_shows_category() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        let hazard_path = base.join("state.ts");
+        std::fs::write(&hazard_path, "export let counter = 0;\n").unwrap();
+
+        let service_path = base.join("service.ts");
+        std::fs::write(
+            &service_path,
+            "import { counter } from './state';\nexport function count() { return counter; }\n",
+        )
+        .unwrap();
+
+        let test_path = base.join("cat.test.ts");
+        std::fs::write(
+            &test_path,
+            "import { count } from './service';\ntest('count', () => { count(); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &[service_path, hazard_path]);
+
+        let warnings: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability" && d.severity == isofence::rule::Severity::Warning)
+            .collect();
+
+        assert!(!warnings.is_empty(), "Expected transitive hazard warnings");
+
+        let help = warnings[0].help.as_ref().unwrap();
+        assert!(
+            help.contains("mutable state"),
+            "Help should contain category '(mutable state)', got: {help}"
+        );
+    }
+
+    #[test]
+    fn transitive_hazard_help_truncates_over_3() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // Create 4 hazardous modules behind a single first-hop
+        for i in 1..=4 {
+            let name = format!("hazard{i}.ts");
+            std::fs::write(base.join(&name), format!("export let state{i} = 0;\n")).unwrap();
+        }
+
+        // Service imports all 4
+        let service_path = base.join("service.ts");
+        std::fs::write(
+            &service_path,
+            "import { state1 } from './hazard1';\n\
+             import { state2 } from './hazard2';\n\
+             import { state3 } from './hazard3';\n\
+             import { state4 } from './hazard4';\n\
+             export function svc() {}\n",
+        )
+        .unwrap();
+
+        let test_path = base.join("trunc.test.ts");
+        std::fs::write(
+            &test_path,
+            "import { svc } from './service';\ntest('svc', () => { svc(); });\n",
+        )
+        .unwrap();
+
+        let source_files: Vec<std::path::PathBuf> = (1..=4)
+            .map(|i| base.join(format!("hazard{i}.ts")))
+            .chain(std::iter::once(service_path))
+            .collect();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &source_files);
+
+        let warnings: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability" && d.severity == isofence::rule::Severity::Warning)
+            .collect();
+
+        assert!(!warnings.is_empty(), "Expected transitive hazard warnings");
+
+        let help = warnings[0].help.as_ref().unwrap();
+        assert!(
+            help.contains("and 1 more"),
+            "Help with 4 modules should truncate to 3 + 'and 1 more', got: {help}"
+        );
+        assert!(
+            help.contains("--json for full list"),
+            "Truncated help should mention --json, got: {help}"
+        );
+    }
+
+    #[test]
     fn diagnostics_only_on_test_files() {
         let dir = tempdir().unwrap();
 
@@ -736,5 +940,555 @@ mod integration {
             "files_failed ({}) should not exceed files_checked ({})",
             result.files_failed, result.files_checked,
         );
+    }
+
+    #[test]
+    fn safe_only_import_skips_diagnostic() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // service.ts has mutable state + safe export
+        let source_path = base.join("service.ts");
+        std::fs::write(
+            &source_path,
+            r#"let counter = 0;
+export function increment() { counter++; }
+export const PI = 3.14;
+"#,
+        )
+        .unwrap();
+
+        // Test only imports the safe export
+        let test_path = base.join("safe.test.ts");
+        std::fs::write(
+            &test_path,
+            "import { PI } from './service';\ntest('pi', () => { expect(PI).toBe(3.14); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &[source_path]);
+
+        let reachability: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        assert!(
+            reachability.is_empty(),
+            "Importing only safe export PI should NOT produce hazard-reachability diagnostic, got: {:?}",
+            reachability.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn mutating_import_produces_diagnostic_with_details() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // service.ts has mutable state
+        let source_path = base.join("service.ts");
+        std::fs::write(
+            &source_path,
+            r#"let counter = 0;
+export function increment() { counter++; }
+export function getCount() { return counter; }
+export const PI = 3.14;
+"#,
+        )
+        .unwrap();
+
+        // Test imports mutating and reading exports
+        let test_path = base.join("mutation.test.ts");
+        std::fs::write(
+            &test_path,
+            "import { increment, getCount } from './service';\ntest('inc', () => { increment(); expect(getCount()).toBe(1); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &[source_path]);
+
+        let reachability: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        assert!(
+            !reachability.is_empty(),
+            "Importing mutating export should produce hazard-reachability diagnostic"
+        );
+
+        // Should have hazardous_imports details
+        let diag = &reachability[0];
+        assert!(
+            !diag.hazardous_imports.is_empty(),
+            "Diagnostic should include hazardous_imports details"
+        );
+
+        // Check that increment is classified as mutating
+        let has_mutating = diag.hazardous_imports.iter().any(|hi| {
+            hi.symbol_name == "increment"
+                && hi.impact == MutationImpact::Mutating
+        });
+        assert!(
+            has_mutating,
+            "Should classify 'increment' as Mutating, got: {:?}",
+            diag.hazardous_imports
+                .iter()
+                .map(|hi| format!("{}: {:?}", hi.symbol_name, hi.impact))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn namespace_import_reports_all_hazards() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        let source_path = base.join("service.ts");
+        std::fs::write(
+            &source_path,
+            r#"let counter = 0;
+export function increment() { counter++; }
+export const PI = 3.14;
+"#,
+        )
+        .unwrap();
+
+        // Test uses namespace import — accesses all exports
+        let test_path = base.join("ns.test.ts");
+        std::fs::write(
+            &test_path,
+            "import * as svc from './service';\ntest('ns', () => { svc.increment(); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &[source_path]);
+
+        let reachability: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        assert!(
+            !reachability.is_empty(),
+            "Namespace import of module with hazards should produce diagnostic"
+        );
+    }
+
+    #[test]
+    fn non_exported_const_not_hazardous() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // Module with non-exported mutable const + safe exported function
+        // The const is mutable but NOT exported and NOT referenced by any export
+        let source_path = base.join("internal.ts");
+        std::fs::write(
+            &source_path,
+            r#"const internalCache = new Map();
+export function greet(name: string) { return `Hello ${name}`; }
+"#,
+        )
+        .unwrap();
+
+        let test_path = base.join("app.test.ts");
+        std::fs::write(
+            &test_path,
+            "import { greet } from './internal';\ntest('greet', () => { expect(greet('World')).toBe('Hello World'); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &[source_path]);
+
+        let reachability: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        // Non-exported const not referenced by any export should not create a hazard
+        assert!(
+            reachability.is_empty(),
+            "Non-exported mutable const (not referenced by exports) should NOT produce hazard-reachability diagnostic, got: {:?}",
+            reachability.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn exported_const_still_hazardous() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // Module with exported mutable const — should still be a hazard
+        let source_path = base.join("state.ts");
+        std::fs::write(
+            &source_path,
+            "export const handlers: Function[] = [];\n",
+        )
+        .unwrap();
+
+        let test_path = base.join("handler.test.ts");
+        std::fs::write(
+            &test_path,
+            "import { handlers } from './state';\ntest('handlers', () => { expect(handlers).toBeDefined(); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &[source_path]);
+
+        let reachability: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        assert!(
+            !reachability.is_empty(),
+            "Exported mutable const (empty array) should still produce hazard-reachability diagnostic"
+        );
+    }
+
+    #[test]
+    fn non_exported_const_referenced_by_mutating_export() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // Module with non-exported mutable const referenced by exported mutating function
+        let source_path = base.join("cache.ts");
+        std::fs::write(
+            &source_path,
+            r#"const cache = new Map();
+export function set(k: string, v: string) { cache.set(k, v); }
+export function get(k: string) { return cache.get(k); }
+"#,
+        )
+        .unwrap();
+
+        let test_path = base.join("cache.test.ts");
+        std::fs::write(
+            &test_path,
+            "import { set, get } from './cache';\ntest('cache', () => { set('a', 'b'); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &[source_path]);
+
+        let reachability: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        // The non-exported const is referenced by the exported mutating functions,
+        // so the module is still hazardous
+        assert!(
+            !reachability.is_empty(),
+            "Non-exported const referenced by mutating export should still produce hazard-reachability"
+        );
+    }
+
+    #[test]
+    fn primitive_only_object_not_hazardous() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // Module with exported primitive-only object — should be safe
+        let source_path = base.join("constants.ts");
+        std::fs::write(
+            &source_path,
+            r#"export const states = {
+    Alabama: { code: 'AL', timezone: 'America/Chicago' },
+    Alaska: { code: 'AK', timezone: 'America/Anchorage' }
+};
+"#,
+        )
+        .unwrap();
+
+        let test_path = base.join("lookup.test.ts");
+        std::fs::write(
+            &test_path,
+            "import { states } from './constants';\ntest('lookup', () => { expect(states.Alabama.code).toBe('AL'); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &[source_path]);
+
+        let reachability: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        assert!(
+            reachability.is_empty(),
+            "Primitive-only object should NOT produce hazard-reachability diagnostic, got: {:?}",
+            reachability.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn enum_spread_array_not_hazardous() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // Module with enum spread array — should be safe
+        let source_path = base.join("categories.ts");
+        std::fs::write(
+            &source_path,
+            r#"enum SubCategory { A = 'A', B = 'B' }
+enum MainCategory { X = 'X', Y = 'Y' }
+export const allCategories = [...Object.values(SubCategory), ...Object.values(MainCategory)];
+"#,
+        )
+        .unwrap();
+
+        let test_path = base.join("cat.test.ts");
+        std::fs::write(
+            &test_path,
+            "import { allCategories } from './categories';\ntest('cat', () => { expect(allCategories.length).toBeGreaterThan(0); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &[source_path]);
+
+        let reachability: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        assert!(
+            reachability.is_empty(),
+            "Enum spread array should NOT produce hazard-reachability diagnostic, got: {:?}",
+            reachability.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+}
+
+// ---- Export Mutation Analysis Parser Tests ----
+
+mod export_analysis {
+    use super::*;
+
+    fn analyze(source: &str) -> Vec<(String, MutationImpact)> {
+        let allocator = Allocator::default();
+        let result = parse_source(&allocator, source, &path("module.ts"));
+        assert!(!result.panicked, "Parse failed");
+
+        let exports = extract_exports(&result.program);
+        let mutable_bindings = collect_module_mutable_bindings(&result.program);
+        let analyses = analyze_export_mutation(&result.program, &exports, &mutable_bindings);
+
+        analyses
+            .iter()
+            .map(|a| (a.entry.exported_name.clone(), a.impact.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn mutating_export_function() {
+        let results = analyze(
+            r#"let counter = 0;
+export function increment() { counter++; }"#,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "increment");
+        assert_eq!(results[0].1, MutationImpact::Mutating);
+    }
+
+    #[test]
+    fn reading_export_function() {
+        let results = analyze(
+            r#"let counter = 0;
+export function getCount() { return counter; }"#,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "getCount");
+        assert_eq!(results[0].1, MutationImpact::Reading);
+    }
+
+    #[test]
+    fn safe_export_const() {
+        let results = analyze("export const PI = 3.14;");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "PI");
+        assert_eq!(results[0].1, MutationImpact::Safe);
+    }
+
+    #[test]
+    fn safe_pure_function() {
+        let results = analyze(
+            r#"let counter = 0;
+export function add(a: number, b: number) { return a + b; }"#,
+        );
+        let add = results.iter().find(|r| r.0 == "add").unwrap();
+        assert_eq!(add.1, MutationImpact::Safe);
+    }
+
+    #[test]
+    fn shadowed_variable() {
+        let results = analyze(
+            r#"let counter = 0;
+export function f() { let counter = 0; counter++; }"#,
+        );
+        let f = results.iter().find(|r| r.0 == "f").unwrap();
+        assert_eq!(
+            f.1,
+            MutationImpact::Safe,
+            "Shadowed variable should not trigger Mutating"
+        );
+    }
+
+    #[test]
+    fn collection_mutation() {
+        let results = analyze(
+            r#"const cache = new Map();
+export function add(k: string, v: string) { cache.set(k, v); }"#,
+        );
+        let add = results.iter().find(|r| r.0 == "add").unwrap();
+        assert_eq!(add.1, MutationImpact::Mutating);
+    }
+
+    #[test]
+    fn reexport_is_unknown() {
+        let results = analyze("export { foo } from './other';");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "foo");
+        assert_eq!(results[0].1, MutationImpact::Unknown);
+    }
+
+    #[test]
+    fn exported_mutable_binding_is_mutating() {
+        let results = analyze("export let counter = 0;");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "counter");
+        assert_eq!(results[0].1, MutationImpact::Mutating);
+    }
+
+    #[test]
+    fn mixed_exports_classified_correctly() {
+        let results = analyze(
+            r#"let counter = 0;
+export function increment() { counter++; }
+export function getCount() { return counter; }
+export const PI = 3.14;
+export function pure(x: number) { return x + 1; }"#,
+        );
+
+        let inc = results.iter().find(|r| r.0 == "increment").unwrap();
+        assert_eq!(inc.1, MutationImpact::Mutating);
+
+        let get = results.iter().find(|r| r.0 == "getCount").unwrap();
+        assert_eq!(get.1, MutationImpact::Reading);
+
+        let pi = results.iter().find(|r| r.0 == "PI").unwrap();
+        assert_eq!(pi.1, MutationImpact::Safe);
+
+        let pure = results.iter().find(|r| r.0 == "pure").unwrap();
+        assert_eq!(pure.1, MutationImpact::Safe);
+    }
+
+    #[test]
+    fn arrow_function_export() {
+        let results = analyze(
+            r#"let state = 0;
+export const mutate = () => { state = 1; };
+export const read = () => state;
+export const pure = () => 42;"#,
+        );
+
+        let mutate = results.iter().find(|r| r.0 == "mutate").unwrap();
+        assert_eq!(mutate.1, MutationImpact::Mutating);
+
+        let read = results.iter().find(|r| r.0 == "read").unwrap();
+        assert_eq!(read.1, MutationImpact::Reading);
+
+        let pure = results.iter().find(|r| r.0 == "pure").unwrap();
+        assert_eq!(pure.1, MutationImpact::Safe);
+    }
+
+    #[test]
+    fn export_default_function() {
+        let results = analyze(
+            r#"let counter = 0;
+export default function increment() { counter++; }"#,
+        );
+        let default = results.iter().find(|r| r.0 == "default").unwrap();
+        assert_eq!(default.1, MutationImpact::Mutating);
+    }
+
+    #[test]
+    fn no_mutable_bindings_all_safe() {
+        let results = analyze(
+            r#"export const PI = 3.14;
+export function add(a: number, b: number) { return a + b; }"#,
+        );
+        assert!(
+            results.iter().all(|r| r.1 == MutationImpact::Safe),
+            "All exports should be Safe when no mutable bindings exist"
+        );
+    }
+
+    #[test]
+    fn array_push_is_mutating() {
+        let results = analyze(
+            r#"const items: string[] = [];
+export function addItem(item: string) { items.push(item); }"#,
+        );
+        let add_item = results.iter().find(|r| r.0 == "addItem").unwrap();
+        assert_eq!(add_item.1, MutationImpact::Mutating);
+    }
+
+    #[test]
+    fn object_property_assignment_is_mutating() {
+        let results = analyze(
+            r#"const config = {};
+export function setKey(k: string, v: string) { config[k] = v; }"#,
+        );
+        let set_key = results.iter().find(|r| r.0 == "setKey").unwrap();
+        assert_eq!(set_key.1, MutationImpact::Mutating);
     }
 }

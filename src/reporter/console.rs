@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::engine::EngineResult;
 use crate::reporter::{get_source_line, offset_to_location, Reporter};
-use crate::rule::{Diagnostic, HazardSource, Severity};
+use crate::rule::{Diagnostic, HazardSource, HazardousImport, Severity};
 
 pub struct ConsoleReporter {
     pub project_root: std::path::PathBuf,
@@ -135,21 +135,67 @@ impl Reporter for ConsoleReporter {
                 .if_supports_color(Stdout, |s| s.red()),
         );
 
-        // Count by rule
-        let mut rule_counts: HashMap<&str, usize> = HashMap::new();
+        // Problem count summary (ESLint-style)
+        let error_count = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count();
+        let warning_count = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .count();
+        let total_problems = error_count + warning_count;
+
+        if total_problems > 0 {
+            let breakdown = match (error_count, warning_count) {
+                (0, w) => format!("{w} warning(s)")
+                    .if_supports_color(Stdout, |s| s.yellow())
+                    .to_string(),
+                (e, 0) => format!("{e} error(s)")
+                    .if_supports_color(Stdout, |s| s.red())
+                    .to_string(),
+                (e, w) => format!(
+                    "{}, {}",
+                    format!("{e} error(s)")
+                        .if_supports_color(Stdout, |s| s.red()),
+                    format!("{w} warning(s)")
+                        .if_supports_color(Stdout, |s| s.yellow()),
+                ),
+            };
+            println!(
+                "  {} {} ({})",
+                "✖".if_supports_color(Stdout, |s| s.red()),
+                format_args!("{total_problems} problem(s)"),
+                breakdown,
+            );
+        }
+
+        // Count by rule + severity
+        let mut rule_severity_counts: HashMap<(&str, Severity), usize> = HashMap::new();
         for d in &result.diagnostics {
             if d.severity != Severity::Off {
-                *rule_counts.entry(&d.rule_name).or_default() += 1;
+                *rule_severity_counts
+                    .entry((&d.rule_name, d.severity))
+                    .or_default() += 1;
             }
         }
 
-        if !rule_counts.is_empty() {
-            let mut counts: Vec<_> = rule_counts.into_iter().collect();
-            counts.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        if !rule_severity_counts.is_empty() {
+            let mut counts: Vec<_> = rule_severity_counts.into_iter().collect();
+            counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0 .0.cmp(b.0 .0)));
 
             let parts: Vec<String> = counts
                 .iter()
-                .map(|(name, count)| format!("{count} {name}"))
+                .map(|((name, sev), count)| {
+                    let sev_label = match sev {
+                        Severity::Error => "error",
+                        Severity::Warning => "warning",
+                        Severity::Off => unreachable!(),
+                    };
+                    format!("{count} {name} ({sev_label})")
+                })
                 .collect();
             println!("  {}", parts.join(", "));
         }
@@ -293,6 +339,11 @@ fn render_fallback(d: &Diagnostic, line_width: usize, project_root: &Path) {
         );
     }
 
+    // Render hazardous import details (export-level mutation analysis)
+    if !d.hazardous_imports.is_empty() {
+        render_hazardous_imports(&gutter, &d.hazardous_imports);
+    }
+
     // Render hazard source lines
     for hs in &d.hazard_sources {
         render_hazard_source(&gutter, hs, project_root);
@@ -303,6 +354,40 @@ fn render_fallback(d: &Diagnostic, line_width: usize, project_root: &Path) {
             " {gutter}    {} {}",
             "=".if_supports_color(Stdout, |s| s.dimmed()),
             format!("help: {help}").if_supports_color(Stdout, |s| s.dimmed()),
+        );
+    }
+}
+
+/// Render hazardous import details from export-level mutation analysis.
+fn render_hazardous_imports(gutter: &str, imports: &[HazardousImport]) {
+    use crate::engine::context::MutationImpact;
+
+    for hi in imports {
+        let impact_label = match hi.impact {
+            MutationImpact::Mutating => "Mutating",
+            MutationImpact::Reading => "Reading",
+            MutationImpact::Unknown => "Unknown",
+            MutationImpact::Safe => continue,
+        };
+
+        let bindings = if hi.referenced_bindings.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " ({}s `{}`)",
+                if hi.impact == MutationImpact::Mutating {
+                    "write"
+                } else {
+                    "read"
+                },
+                hi.referenced_bindings.join("`, `")
+            )
+        };
+
+        let line = format!("{impact_label}: `{}`{bindings}", hi.symbol_name);
+        println!(
+            " {gutter}    {}",
+            line.if_supports_color(Stdout, |s| s.dimmed()),
         );
     }
 }

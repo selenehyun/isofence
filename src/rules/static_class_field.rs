@@ -98,6 +98,7 @@ fn check_class_static_fields(class: &Class<'_>, ctx: &ModuleContext) -> Vec<Diag
                     fix: None,
                     import_chain: None,
                     hazard_sources: vec![],
+                    hazardous_imports: vec![],
                 });
             }
         }

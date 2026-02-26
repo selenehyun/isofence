@@ -107,10 +107,30 @@ mod mutable_const_init {
     }
 
     #[test]
-    fn detects_const_object() {
-        let msgs = check("const state = { count: 0 };");
+    fn detects_const_object_with_call() {
+        // Object with a call expression value is still mutable
+        let msgs = check("const state = { handler: createHandler() };");
         assert_eq!(msgs.len(), 1);
         assert!(msgs[0].contains("object literal"));
+    }
+
+    #[test]
+    fn ignores_primitive_only_object() {
+        // Object with only primitive values is safe
+        assert!(check("const config = { count: 0, name: 'test', flag: true };").is_empty());
+    }
+
+    #[test]
+    fn ignores_nested_primitive_only_object() {
+        // Nested object with only primitive values is safe
+        assert!(check("const states = { AL: { code: 'AL', tz: 'America/Chicago' } };").is_empty());
+    }
+
+    #[test]
+    fn detects_nested_object_with_call() {
+        // Nested object with call expression is NOT safe
+        let msgs = check("const config = { db: { client: createClient() } };");
+        assert_eq!(msgs.len(), 1);
     }
 
     #[test]
@@ -263,6 +283,121 @@ mod mutable_const_init {
     #[test]
     fn ignores_injection_token() {
         assert!(check("const HTTP = new InjectionToken('HTTP');").is_empty());
+    }
+
+    #[test]
+    fn ignores_enum_spread_array() {
+        // [...Object.values(Enum)] pattern is safe (enum value collection)
+        assert!(check("const categories = [...Object.values(SubCategory), ...Object.values(MainCategory)];").is_empty());
+    }
+
+    #[test]
+    fn ignores_object_keys_spread_array() {
+        assert!(check("const keys = [...Object.keys(SomeEnum)];").is_empty());
+    }
+
+    #[test]
+    fn detects_mixed_spread_array() {
+        // Array with a spread + non-spread element is NOT safe
+        let msgs = check("const items = [...Object.values(Foo), someCall()];");
+        assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn ignores_process_env_object() {
+        // Object with process.env values is safe (primitive-only: member expressions are primitive leaves)
+        assert!(check("const config = { host: process.env.DB_HOST, port: 3306 };").is_empty());
+    }
+
+    #[test]
+    fn detects_empty_object() {
+        // Empty object is still mutable (container for accumulation)
+        let msgs = check("const cache = {};");
+        assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn detects_empty_array() {
+        // Empty array is still mutable (container for accumulation)
+        let msgs = check("const items: string[] = [];");
+        assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn ignores_spread_with_primitive_properties() {
+        // { ...base, key: true } — spread from identifier + primitive own properties
+        assert!(check("const config = { ...base, key: true, port: 3306 };").is_empty());
+    }
+
+    #[test]
+    fn ignores_spread_with_env_properties() {
+        // { ...base, host: process.env.HOST } — member expressions are primitive leaves
+        assert!(check("const config = { ...base, host: process.env.DB_HOST };").is_empty());
+    }
+
+    #[test]
+    fn ignores_multiple_spread_with_primitives() {
+        // { ...base, ...override, key: 1 } — multiple spreads + primitive own property
+        assert!(check("const config = { ...base, ...override_, key: 1 };").is_empty());
+    }
+
+    #[test]
+    fn ignores_nested_spread_with_primitives() {
+        // { ...base, nested: { ...inner, x: 1 } } — nested spread objects
+        assert!(check("const config = { ...base, nested: { ...inner, x: 1 } };").is_empty());
+    }
+
+    #[test]
+    fn detects_pure_spread_object() {
+        // { ...original } — no own properties, just aliasing
+        let msgs = check("const config = { ...original };");
+        assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn ignores_logical_expression_property() {
+        // { ...base, sync: isStage && !isTenant } — logical expression is primitive
+        assert!(check("const config = { ...base, sync: isStage && !isTenant };").is_empty());
+    }
+
+    #[test]
+    fn ignores_ternary_expression_property() {
+        // { ...base, port: isProd ? 3306 : 5432 } — conditional expression is primitive
+        assert!(check("const config = { ...base, port: isProd ? 3306 : 5432 };").is_empty());
+    }
+
+    #[test]
+    fn ignores_binary_expression_property() {
+        // { ...base, timeout: baseTimeout * 2 } — binary expression is primitive
+        assert!(check("const config = { ...base, timeout: baseTimeout * 2 };").is_empty());
+    }
+
+    #[test]
+    fn detects_logical_with_call_operand() {
+        // { ...base, flag: getConfig() && true } — call in logical expression
+        let msgs = check("const config = { ...base, flag: getConfig() && true };");
+        assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn detects_spread_from_call() {
+        // { ...getDefaults(), port: 3306 } — spread from call expression
+        let msgs = check("const config = { ...getDefaults(), port: 3306 };");
+        assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn detects_spread_from_member() {
+        // { ...obj.nested, port: 3306 } — spread from member expression
+        let msgs = check("const config = { ...obj.nested, port: 3306 };");
+        assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn detects_spread_with_call_property() {
+        // { ...base, handler: createHandler() } — non-primitive own property
+        let msgs = check("const config = { ...base, handler: createHandler() };");
+        assert_eq!(msgs.len(), 1);
     }
 
     #[test]
@@ -544,8 +679,15 @@ mod static_class_field {
 
     #[test]
     fn detects_static_object_field() {
-        let msgs = check("class Foo { static config = { debug: false }; }");
+        // Object with a call value is still mutable
+        let msgs = check("class Foo { static config = { client: createClient() }; }");
         assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn ignores_static_primitive_only_object() {
+        // Primitive-only object is safe
+        assert!(check("class Foo { static config = { debug: false, port: 3000 }; }").is_empty());
     }
 
     #[test]

@@ -3,7 +3,7 @@ use oxc_span::Span;
 use std::fmt;
 use std::path::PathBuf;
 
-use crate::engine::context::{GraphContext, ModuleContext};
+use crate::engine::context::{GraphContext, ModuleContext, MutationImpact};
 
 /// Severity level for diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Deserialize)]
@@ -40,6 +40,15 @@ pub enum HazardCategory {
     SideEffect,
 }
 
+impl fmt::Display for HazardCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HazardCategory::MutableState => write!(f, "mutable state"),
+            HazardCategory::SideEffect => write!(f, "side effect"),
+        }
+    }
+}
+
 /// A detected hazard in a module.
 #[derive(Debug, Clone)]
 pub struct Hazard {
@@ -48,6 +57,8 @@ pub struct Hazard {
     pub confidence: Confidence,
     pub span: Span,
     pub message: String,
+    /// The export name this hazard is associated with (None = file-level/ambient hazard).
+    pub associated_export: Option<String>,
 }
 
 /// A diagnostic produced by a rule.
@@ -64,6 +75,16 @@ pub struct Diagnostic {
     pub import_chain: Option<Vec<PathBuf>>,
     /// Source locations of hazards in the referenced module (hazard-reachability only).
     pub hazard_sources: Vec<HazardSource>,
+    /// Per-symbol mutation impact details (hazard-reachability only).
+    pub hazardous_imports: Vec<HazardousImport>,
+}
+
+/// Detail about a hazardous import symbol.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HazardousImport {
+    pub symbol_name: String,
+    pub impact: MutationImpact,
+    pub referenced_bindings: Vec<String>,
 }
 
 /// Source location of a hazard in a referenced module (for hazard-reachability).
@@ -72,6 +93,7 @@ pub struct HazardSource {
     pub file_path: PathBuf,
     pub span: Span,
     pub message: String,
+    pub category: HazardCategory,
 }
 
 /// An auto-fix action.

@@ -16,6 +16,8 @@ struct JsonReport {
     files_checked: usize,
     files_passed: usize,
     files_failed: usize,
+    error_count: usize,
+    warning_count: usize,
     fixable_count: usize,
     diagnostics: Vec<JsonDiagnostic>,
 }
@@ -36,6 +38,16 @@ struct JsonDiagnostic {
     import_chain: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     hazard_sources: Vec<JsonHazardSource>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    hazardous_imports: Vec<JsonHazardousImport>,
+}
+
+#[derive(Serialize)]
+struct JsonHazardousImport {
+    symbol_name: String,
+    impact: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    referenced_bindings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -44,6 +56,7 @@ struct JsonHazardSource {
     line: Option<usize>,
     column: Option<usize>,
     message: String,
+    category: String,
 }
 
 impl Reporter for JsonReporter {
@@ -91,6 +104,7 @@ impl Reporter for JsonReporter {
                         line: hs_line,
                         column: hs_col,
                         message: hs.message.clone(),
+                        category: hs.category.to_string(),
                     }
                 }).collect();
 
@@ -99,6 +113,16 @@ impl Reporter for JsonReporter {
                 } else {
                     None
                 };
+
+                let hazardous_imports: Vec<JsonHazardousImport> = d
+                    .hazardous_imports
+                    .iter()
+                    .map(|hi| JsonHazardousImport {
+                        symbol_name: hi.symbol_name.clone(),
+                        impact: hi.impact.to_string(),
+                        referenced_bindings: hi.referenced_bindings.clone(),
+                    })
+                    .collect();
 
                 JsonDiagnostic {
                     rule: d.rule_name.clone(),
@@ -112,6 +136,7 @@ impl Reporter for JsonReporter {
                     suggestion,
                     import_chain,
                     hazard_sources,
+                    hazardous_imports,
                 }
             })
             .collect();
@@ -123,6 +148,16 @@ impl Reporter for JsonReporter {
                 .to_string()
         });
 
+        let error_count = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count();
+        let warning_count = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Warning)
+            .count();
         let fixable_count = result
             .diagnostics
             .iter()
@@ -135,6 +170,8 @@ impl Reporter for JsonReporter {
             files_checked: result.files_checked,
             files_passed: result.files_passed,
             files_failed: result.files_failed,
+            error_count,
+            warning_count,
             fixable_count,
             diagnostics,
         };

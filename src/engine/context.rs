@@ -4,6 +4,65 @@ use std::path::{Path, PathBuf};
 
 use crate::engine::graph::ModuleGraph;
 
+/// Import specifier: which symbol is imported.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ImportSpecifier {
+    pub imported_name: String,
+    pub local_name: String,
+}
+
+/// The kind of an import statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportKind {
+    Named(Vec<ImportSpecifier>),
+    Default(String),
+    Namespace(String),
+    Combined {
+        default_local: String,
+        named: Vec<ImportSpecifier>,
+    },
+    SideEffect,
+}
+
+/// A module's export entry extracted from the AST.
+#[derive(Debug, Clone)]
+pub struct ExportEntry {
+    pub exported_name: String,
+    pub local_name: String,
+    pub span: Span,
+    pub is_reexport: bool,
+    pub source_specifier: Option<String>,
+}
+
+/// Mutation impact classification for an export.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MutationImpact {
+    Mutating,
+    Reading,
+    Safe,
+    Unknown,
+}
+
+impl std::fmt::Display for MutationImpact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MutationImpact::Mutating => write!(f, "mutating"),
+            MutationImpact::Reading => write!(f, "reading"),
+            MutationImpact::Safe => write!(f, "safe"),
+            MutationImpact::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+/// Export analysis result: export entry + mutation classification.
+#[derive(Debug, Clone)]
+pub struct ExportAnalysis {
+    pub entry: ExportEntry,
+    pub impact: MutationImpact,
+    pub referenced_bindings: Vec<String>,
+}
+
 /// Kind of mock applied to a module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MockKind {
@@ -30,6 +89,7 @@ pub struct ImportInfo {
     pub is_type_only: bool,
     pub is_side_effect: bool,
     pub span: Span,
+    pub kind: ImportKind,
 }
 
 /// Kind of edge in the module graph.
@@ -135,6 +195,10 @@ pub struct GraphContext {
     pub module_hazards: HashMap<PathBuf, Vec<crate::rule::Hazard>>,
     /// Per-test-file module context summary.
     pub test_contexts: HashMap<PathBuf, TestContextSummary>,
+    /// Per-module export analysis results.
+    pub export_analyses: HashMap<PathBuf, Vec<ExportAnalysis>>,
+    /// Per-module import info (with resolved paths and ImportKind).
+    pub all_imports: HashMap<PathBuf, Vec<ImportInfo>>,
 }
 
 /// Summary of a test file's context for graph analysis.
