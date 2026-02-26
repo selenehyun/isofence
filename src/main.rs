@@ -60,6 +60,10 @@ struct Cli {
     /// Only show files with issues
     #[arg(short, long)]
     quiet: bool,
+
+    /// Show all files (disable truncation)
+    #[arg(long)]
+    all: bool,
 }
 
 fn main() {
@@ -176,6 +180,7 @@ fn main() {
         OutputFormat::Console => Box::new(ConsoleReporter {
             project_root: project_root.clone(),
             quiet: config.quiet,
+            show_all: cli.all,
         }),
     };
 

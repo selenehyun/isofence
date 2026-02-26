@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 use crate::engine::EngineResult;
-use crate::reporter::Reporter;
+use crate::reporter::{offset_to_location, Reporter};
 use crate::rule::Severity;
 
 pub struct JsonReporter {
@@ -40,7 +40,7 @@ impl Reporter for JsonReporter {
 
                 let (line, column) = if d.span.start > 0 {
                     let source = std::fs::read_to_string(&d.file_path).unwrap_or_default();
-                    let (l, c) = offset_to_line_col(&source, d.span.start);
+                    let (l, c, _, _) = offset_to_location(&source, d.span.start);
                     (Some(l), Some(c))
                 } else {
                     (None, None)
@@ -68,24 +68,4 @@ impl Reporter for JsonReporter {
 
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
     }
-}
-
-fn offset_to_line_col(source: &str, offset: u32) -> (usize, usize) {
-    let offset = offset as usize;
-    let mut line = 1;
-    let mut col = 1;
-
-    for (i, c) in source.char_indices() {
-        if i >= offset {
-            break;
-        }
-        if c == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-    }
-
-    (line, col)
 }
