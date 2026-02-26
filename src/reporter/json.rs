@@ -31,6 +31,8 @@ struct JsonDiagnostic {
     help: Option<String>,
     fixable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    suggestion: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     import_chain: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     hazard_sources: Vec<JsonHazardSource>,
@@ -92,6 +94,12 @@ impl Reporter for JsonReporter {
                     }
                 }).collect();
 
+                let suggestion = if d.fix.is_none() && d.rule_name == "hazard-reachability" {
+                    d.help.clone()
+                } else {
+                    None
+                };
+
                 JsonDiagnostic {
                     rule: d.rule_name.clone(),
                     severity: d.severity.to_string(),
@@ -101,6 +109,7 @@ impl Reporter for JsonReporter {
                     column,
                     help: d.help.clone(),
                     fixable: d.fix.is_some(),
+                    suggestion,
                     import_chain,
                     hazard_sources,
                 }

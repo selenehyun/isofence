@@ -74,13 +74,17 @@ fn apply_fix_to_file(
         existing_mocks.iter().map(|m| m.source.clone()).collect();
 
     // Generate mock insertions for diagnostics that need them (deduplicated)
+    // fix.text contains absolute paths — convert to relative format for dedup
+    // comparison against existing_mock_sources which are relative (e.g., '../../config')
     let mut seen_modules: HashSet<String> = HashSet::new();
     let insertions: Vec<MockInsertion> = diagnostics
         .iter()
         .filter_map(|d| {
             if let Some(ref fix) = d.fix {
+                let rel_source =
+                    path::compute_relative_path(test_file, Path::new(&fix.text));
                 Some(MockInsertion {
-                    module_source: fix.text.clone(),
+                    module_source: rel_source,
                     span: fix.span,
                 })
             } else {
@@ -104,12 +108,11 @@ fn apply_fix_to_file(
     let insert_offset =
         insertion::find_insertion_point(&parse_result.program, config.framework);
 
-    // Generate mock statements
+    // Generate mock statements (module_source is already a relative path)
     let mock_fn = config.framework.mock_fn_name();
     let mut mock_text = String::new();
     for ins in &insertions {
-        let rel_path = path::compute_relative_path(test_file, Path::new(&ins.module_source));
-        mock_text.push_str(&format!("\n{}('{}');", mock_fn, rel_path));
+        mock_text.push_str(&format!("\n{}('{}');", mock_fn, ins.module_source));
     }
 
     // Apply insertion

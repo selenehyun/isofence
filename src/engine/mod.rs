@@ -80,9 +80,13 @@ impl Engine {
         // Apply allowlist: remove allowed modules from hazards and diagnostics
         module_hazards.retain(|path, _| !self.config.is_allowed(path));
 
+        // Resolve mock paths before graph analysis
+        let resolver = self.create_resolver();
+        self.resolve_mock_paths(&mut test_contexts, &resolver);
+
         // Phase 3: Graph analysis
         progress.start_graph_phase();
-        let graph = self.build_graph(&per_file_results, &all_imports);
+        let graph = self.build_graph(&per_file_results, &all_imports, &resolver);
 
         // Build mock registry from all test contexts (filtered by allowlist)
         progress.graph_step("Building mock registry...");
@@ -242,11 +246,9 @@ impl Engine {
         &self,
         results: &[FileAnalysisResult],
         all_imports: &HashMap<PathBuf, Vec<crate::engine::context::ImportInfo>>,
+        resolver: &Resolver,
     ) -> ModuleGraph {
         let mut graph = ModuleGraph::new();
-
-        // Create resolver
-        let resolver = self.create_resolver();
 
         // Add all analyzed files as nodes
         for result in results {
@@ -344,6 +346,31 @@ impl Engine {
         Resolver::new(options)
     }
 
+    /// Resolve mock source strings to absolute paths using the resolver.
+    /// This ensures that mocks extracted from test files (e.g., `vi.mock('./config')`)
+    /// get resolved to the same absolute paths used in the module graph, enabling
+    /// `effective_subgraph()` to correctly cut mocked edges.
+    fn resolve_mock_paths(
+        &self,
+        test_contexts: &mut HashMap<PathBuf, TestContextSummary>,
+        resolver: &Resolver,
+    ) {
+        for (test_file, ctx) in test_contexts.iter_mut() {
+            let test_dir = test_file.parent().unwrap_or(Path::new("."));
+            for mock in &mut ctx.mocks {
+                if mock.resolved_path.is_some() {
+                    continue;
+                }
+                if let Ok(resolved) = resolver.resolve(test_dir, &mock.source) {
+                    let resolved_path = resolved.path().to_path_buf();
+                    if !resolved_path.to_string_lossy().contains("node_modules") {
+                        mock.resolved_path = Some(resolved_path);
+                    }
+                }
+            }
+        }
+    }
+
     /// Build the global mock registry from all test contexts.
     fn build_mock_registry(
         &self,
@@ -366,6 +393,10 @@ impl Engine {
     }
 
     /// Hazard reachability: for each test file, find hazardous modules in the effective subgraph.
+    /// Uses a two-pass approach:
+    ///   Pass 1 — Classify each reachable hazard as direct (chain=2) or transitive (chain>=3).
+    ///   Pass 2 — Direct hazards get `fix: Some(...)`, transitive hazards are grouped by
+    ///            first-hop and emitted as a single Warning-level suggestion per group.
     fn run_hazard_reachability(&self, ctx: &GraphContext, progress: &dyn Progress) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
 
@@ -373,63 +404,136 @@ impl Engine {
             let effective = ctx.graph.effective_subgraph(test_file, &test_ctx.mocks);
             progress.reachability_step();
 
+            // Pass 1: Classify hazards as direct or transitive
+            struct HazardEntry {
+                module_path: PathBuf,
+                chain: Option<Vec<PathBuf>>,
+                hazards: Vec<Hazard>,
+            }
+
+            let mut direct_hazards: Vec<HazardEntry> = Vec::new();
+            // Transitive hazards grouped by first-hop module
+            let mut transitive_by_first_hop: HashMap<PathBuf, Vec<HazardEntry>> = HashMap::new();
+
             for module_path in &effective {
                 if module_path == test_file {
                     continue;
                 }
 
-                // Skip allowed modules
                 if self.config.is_allowed(module_path) {
                     continue;
                 }
 
-                // Check if module has hazards
                 if let Some(hazards) = ctx.module_hazards.get(module_path) {
                     if hazards.is_empty() {
                         continue;
                     }
 
-                    // Full relative path of hazardous module
-                    let module_rel = pathdiff::diff_paths(module_path, &self.config.project_root)
-                        .unwrap_or_else(|| module_path.clone());
-
-                    // Compute mock-aware import chain
                     let chain = ctx.graph.shortest_unmocked_path(
                         test_file,
                         module_path,
                         &test_ctx.mocks,
                     );
 
-                    let message = format!(
-                        "Unmocked hazardous module `{}`",
-                        module_rel.display()
-                    );
+                    let chain_len = chain.as_ref().map_or(0, |c| c.len());
 
-                    let sources: Vec<HazardSource> = hazards
-                        .iter()
-                        .take(3)
-                        .map(|h| HazardSource {
-                            file_path: module_path.clone(),
+                    let entry = HazardEntry {
+                        module_path: module_path.clone(),
+                        chain,
+                        hazards: hazards.clone(),
+                    };
+
+                    if chain_len <= 2 {
+                        // Direct: test → hazardous module (chain = [test, module])
+                        direct_hazards.push(entry);
+                    } else {
+                        // Transitive: test → first_hop → ... → hazardous module
+                        let first_hop = entry.chain.as_ref().unwrap()[1].clone();
+                        transitive_by_first_hop
+                            .entry(first_hop)
+                            .or_default()
+                            .push(entry);
+                    }
+                }
+            }
+
+            // Pass 2a: Emit direct hazard diagnostics (with fix)
+            for entry in direct_hazards {
+                let module_rel = pathdiff::diff_paths(&entry.module_path, &self.config.project_root)
+                    .unwrap_or_else(|| entry.module_path.clone());
+
+                let message = format!(
+                    "Unmocked hazardous module `{}`",
+                    module_rel.display()
+                );
+
+                let sources: Vec<HazardSource> = entry.hazards
+                    .iter()
+                    .take(3)
+                    .map(|h| HazardSource {
+                        file_path: entry.module_path.clone(),
+                        span: h.span,
+                        message: h.message.clone(),
+                    })
+                    .collect();
+
+                diagnostics.push(Diagnostic {
+                    rule_name: "hazard-reachability".to_string(),
+                    severity: Severity::Error,
+                    message,
+                    file_path: test_file.clone(),
+                    span: oxc_span::Span::default(),
+                    help: Some("Mock this module to isolate your tests.".to_string()),
+                    fix: Some(Fix {
+                        text: entry.module_path.to_string_lossy().to_string(),
+                        span: oxc_span::Span::default(),
+                    }),
+                    import_chain: entry.chain,
+                    hazard_sources: sources,
+                });
+            }
+
+            // Pass 2b: Emit grouped transitive hazard diagnostics (no fix, Warning)
+            for (first_hop, entries) in &transitive_by_first_hop {
+                let first_hop_rel = pathdiff::diff_paths(first_hop, &self.config.project_root)
+                    .unwrap_or_else(|| first_hop.clone());
+
+                let count = entries.len();
+                let message = format!(
+                    "{count} transitive hazard(s) reachable via `{}`",
+                    first_hop_rel.display()
+                );
+
+                // Representative chain: use first entry
+                let representative_chain = entries[0].chain.clone();
+
+                // Collect up to 3 hazard sources across all entries (1 per module, up to 3)
+                let sources: Vec<HazardSource> = entries
+                    .iter()
+                    .take(3)
+                    .filter_map(|e| {
+                        e.hazards.first().map(|h| HazardSource {
+                            file_path: e.module_path.clone(),
                             span: h.span,
                             message: h.message.clone(),
                         })
-                        .collect();
+                    })
+                    .collect();
 
-                    diagnostics.push(Diagnostic {
-                        rule_name: "hazard-reachability".to_string(),
-                        severity: Severity::Error,
-                        message,
-                        file_path: test_file.clone(),
-                        span: oxc_span::Span::default(),
-                        help: Some("Mock this module to isolate your tests.".to_string()),
-                        fix: Some(Fix {
-                            text: module_path.to_string_lossy().to_string(),
-                            span: oxc_span::Span::default(),
-                        }),
-                        import_chain: chain,
-                        hazard_sources: sources,
-                    });
-                }
+                diagnostics.push(Diagnostic {
+                    rule_name: "hazard-reachability".to_string(),
+                    severity: Severity::Warning,
+                    message,
+                    file_path: test_file.clone(),
+                    span: oxc_span::Span::default(),
+                    help: Some(format!(
+                        "Mock `{}` to block {count} transitive hazard(s), or add specific modules to your allowlist.",
+                        first_hop_rel.display()
+                    )),
+                    fix: None,
+                    import_chain: representative_chain,
+                    hazard_sources: sources,
+                });
             }
         }
 

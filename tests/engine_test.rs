@@ -419,6 +419,290 @@ mod integration {
     }
 
     #[test]
+    fn fix_idempotency_no_duplicate_mocks() {
+        let dir = tempdir().unwrap();
+        // Canonicalize to avoid macOS /var vs /private/var symlink issues
+        let base = dir.path().canonicalize().unwrap();
+
+        // Source file with a hazard
+        let source_path = base.join("config.ts");
+        std::fs::write(&source_path, "export let dbUrl = 'postgres://localhost';\n").unwrap();
+
+        // Test file importing the hazardous module
+        let test_path = base.join("app.test.ts");
+        std::fs::write(
+            &test_path,
+            "import { dbUrl } from './config';\ntest('uses config', () => { expect(dbUrl).toBeDefined(); });\n",
+        )
+        .unwrap();
+
+        // First run: should produce hazard-reachability diagnostic with a fix
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+        let engine = Engine::new(config.clone(), registry);
+
+        let result1 = engine.run_silent(&[test_path.clone()], &[source_path.clone()]);
+        let reachability1: Vec<_> = result1
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        assert!(
+            !reachability1.is_empty(),
+            "First run should produce hazard-reachability diagnostics"
+        );
+        assert!(
+            reachability1.iter().all(|d| d.fix.is_some()),
+            "Hazard-reachability diagnostics should include fixes"
+        );
+
+        // Apply fixes
+        let fix_results = isofence::fix::apply_fixes(&result1.diagnostics, &config).unwrap();
+        for fr in &fix_results {
+            if fr.has_changes() {
+                std::fs::write(&fr.file_path, &fr.fixed).unwrap();
+            }
+        }
+
+        // Verify mock was inserted
+        let fixed_content = std::fs::read_to_string(&test_path).unwrap();
+        assert!(
+            fixed_content.contains("mock(") && fixed_content.contains("config"),
+            "Fix should have inserted a mock for config. Content:\n{}",
+            fixed_content
+        );
+
+        // Second run: should produce NO hazard-reachability diagnostics
+        let config2 = Config::load(base.clone());
+        let mut registry2 = RuleRegistry::new();
+        registry2.register_all(all_builtin_rules());
+        let engine2 = Engine::new(config2, registry2);
+
+        let result2 = engine2.run_silent(&[test_path.clone()], &[source_path.clone()]);
+        let reachability2: Vec<_> = result2
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        assert!(
+            reachability2.is_empty(),
+            "Second run (after fix) should have no hazard-reachability diagnostics, but got: {:?}",
+            reachability2.iter()
+                .map(|d| format!("{}: {}", d.file_path.display(), d.message))
+                .collect::<Vec<_>>(),
+        );
+
+        // Third run: applying fixes again should not add duplicate mocks
+        let config3 = Config::load(base.clone());
+        let fix_results2 = isofence::fix::apply_fixes(&result2.diagnostics, &config3).unwrap();
+        let changes: Vec<_> = fix_results2.iter().filter(|fr| fr.has_changes()).collect();
+        assert!(
+            changes.is_empty(),
+            "Third run should not produce any file changes (idempotent)"
+        );
+    }
+
+    #[test]
+    fn transitive_hazard_not_fixable() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // db.ts — hazardous (mutable module var)
+        let db_path = base.join("db.ts");
+        std::fs::write(&db_path, "export let connection = null;\n").unwrap();
+
+        // service.ts — clean, imports db
+        let service_path = base.join("service.ts");
+        std::fs::write(
+            &service_path,
+            "import { connection } from './db';\nexport function getConn() { return connection; }\n",
+        )
+        .unwrap();
+
+        // test → service (clean) → db (hazardous)
+        let test_path = base.join("app.test.ts");
+        std::fs::write(
+            &test_path,
+            "import { getConn } from './service';\ntest('conn', () => { getConn(); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &[service_path, db_path]);
+
+        let reachability: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        // No direct hazard imports → no fixable diagnostics
+        let fixable: Vec<_> = reachability.iter().filter(|d| d.fix.is_some()).collect();
+        assert!(
+            fixable.is_empty(),
+            "Transitive hazards should NOT be fixable, got {} fixable diagnostics",
+            fixable.len()
+        );
+
+        // Should have a warning-level grouped diagnostic
+        let warnings: Vec<_> = reachability
+            .iter()
+            .filter(|d| d.severity == isofence::rule::Severity::Warning)
+            .collect();
+        assert!(
+            !warnings.is_empty(),
+            "Expected at least 1 warning for transitive hazards"
+        );
+        assert!(
+            warnings[0].message.contains("transitive"),
+            "Warning message should mention 'transitive', got: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    fn transitive_hazards_grouped_by_first_hop() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // Two hazardous modules behind the same first-hop
+        let db_path = base.join("db.ts");
+        std::fs::write(&db_path, "export let dbConn = null;\n").unwrap();
+
+        let cache_path = base.join("cache.ts");
+        std::fs::write(&cache_path, "export let cacheClient = null;\n").unwrap();
+
+        // service.ts imports both hazardous modules
+        let service_path = base.join("service.ts");
+        std::fs::write(
+            &service_path,
+            "import { dbConn } from './db';\nimport { cacheClient } from './cache';\nexport function init() {}\n",
+        )
+        .unwrap();
+
+        // test → service → db + cache
+        let test_path = base.join("svc.test.ts");
+        std::fs::write(
+            &test_path,
+            "import { init } from './service';\ntest('init', () => { init(); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &[service_path, db_path, cache_path]);
+
+        let reachability: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        // db and cache are both transitive via service → should be grouped into 1 diagnostic
+        assert_eq!(
+            reachability.len(),
+            1,
+            "Expected exactly 1 grouped diagnostic for 2 transitive hazards via service, got {}: {:?}",
+            reachability.len(),
+            reachability.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+
+        // Message should mention count of 2
+        assert!(
+            reachability[0].message.contains("2"),
+            "Grouped diagnostic should mention count '2', got: {}",
+            reachability[0].message
+        );
+    }
+
+    #[test]
+    fn mixed_direct_and_transitive() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // Direct hazard: test imports hazardA directly
+        let hazard_a = base.join("hazard_a.ts");
+        std::fs::write(&hazard_a, "export let directState = 0;\n").unwrap();
+
+        // Transitive hazard: test → service → hazardB
+        let hazard_b = base.join("hazard_b.ts");
+        std::fs::write(&hazard_b, "export let transitiveState = 0;\n").unwrap();
+
+        let service_path = base.join("service.ts");
+        std::fs::write(
+            &service_path,
+            "import { transitiveState } from './hazard_b';\nexport function svc() { return transitiveState; }\n",
+        )
+        .unwrap();
+
+        let test_path = base.join("mixed.test.ts");
+        std::fs::write(
+            &test_path,
+            "import { directState } from './hazard_a';\nimport { svc } from './service';\ntest('mixed', () => {});\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(
+            &[test_path],
+            &[hazard_a, hazard_b, service_path],
+        );
+
+        let reachability: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        // 1 fixable (direct hazard_a) + 1 suggestion (transitive via service)
+        let fixable: Vec<_> = reachability.iter().filter(|d| d.fix.is_some()).collect();
+        let suggestions: Vec<_> = reachability.iter().filter(|d| d.fix.is_none()).collect();
+
+        assert_eq!(
+            fixable.len(),
+            1,
+            "Expected 1 fixable diagnostic (direct hazard), got {}",
+            fixable.len()
+        );
+        assert!(
+            fixable[0].message.contains("hazard_a"),
+            "Fixable diagnostic should reference hazard_a, got: {}",
+            fixable[0].message
+        );
+
+        assert_eq!(
+            suggestions.len(),
+            1,
+            "Expected 1 suggestion diagnostic (transitive via service), got {}",
+            suggestions.len()
+        );
+        assert!(
+            suggestions[0].message.contains("transitive"),
+            "Suggestion should mention 'transitive', got: {}",
+            suggestions[0].message
+        );
+        assert_eq!(
+            suggestions[0].severity,
+            isofence::rule::Severity::Warning,
+            "Transitive diagnostic should be Warning severity"
+        );
+    }
+
+    #[test]
     fn diagnostics_only_on_test_files() {
         let dir = tempdir().unwrap();
 

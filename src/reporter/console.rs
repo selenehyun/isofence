@@ -173,6 +173,26 @@ impl Reporter for ConsoleReporter {
                     .if_supports_color(Stdout, |s| s.dimmed()),
             );
         }
+
+        let suggest_count = result
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                d.severity != Severity::Off
+                    && d.fix.is_none()
+                    && d.rule_name == "hazard-reachability"
+            })
+            .count();
+
+        if suggest_count > 0 {
+            if fixable_count == 0 || self.fix_applied {
+                println!();
+            }
+            println!(
+                "  {} {} issue(s) need manual attention (transitive hazards).",
+                "💡", suggest_count,
+            );
+        }
     }
 }
 
@@ -209,7 +229,13 @@ fn render_source_context(source: &str, d: &Diagnostic, line_width: usize) {
 
     // Underline + rule name
     let underline = "~".repeat(underline_len);
-    let fix_badge = if d.fix.is_some() { " (fix)" } else { "" };
+    let fix_badge = if d.fix.is_some() {
+        " (fix)"
+    } else if d.rule_name == "hazard-reachability" {
+        " (suggest)"
+    } else {
+        ""
+    };
     let annotation = format!(
         "{spaces}{underline} {rule}{fix_badge}",
         spaces = " ".repeat(display_col - 1),
@@ -241,7 +267,13 @@ fn render_fallback(d: &Diagnostic, line_width: usize, project_root: &Path) {
         Severity::Warning => color_by_severity("⚠", Severity::Warning),
         Severity::Off => return,
     };
-    let fix_badge = if d.fix.is_some() { " (fix)" } else { "" };
+    let fix_badge = if d.fix.is_some() {
+        " (fix)"
+    } else if d.rule_name == "hazard-reachability" {
+        " (suggest)"
+    } else {
+        ""
+    };
     let rule_display = format!("{}{}", d.rule_name, fix_badge);
     println!(
         " {gutter}  {icon} {rule}: {msg}",
