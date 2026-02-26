@@ -56,6 +56,11 @@ impl TestFramework {
             TestFramework::Jest | TestFramework::Unknown => "jest.mock",
         }
     }
+
+    /// Returns true if a concrete framework was detected (not Unknown).
+    pub fn is_detected(&self) -> bool {
+        !matches!(self, TestFramework::Unknown)
+    }
 }
 
 /// Safe signal found in a test file (e.g., beforeEach with resetModules).

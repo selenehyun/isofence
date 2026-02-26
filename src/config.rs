@@ -52,6 +52,9 @@ pub struct ConfigFile {
     pub mock_consensus: Option<bool>,
 
     #[serde(default)]
+    pub framework: Option<String>,
+
+    #[serde(default)]
     pub rules: HashMap<String, RuleSeverityOrConfig>,
 
     #[serde(default)]
@@ -119,6 +122,13 @@ impl Config {
         }
         if let Some(consensus) = file.mock_consensus {
             self.mock_consensus = consensus;
+        }
+        if let Some(ref fw) = file.framework {
+            match fw.to_lowercase().as_str() {
+                "vitest" => self.framework = TestFramework::Vitest,
+                "jest" => self.framework = TestFramework::Jest,
+                _ => {} // ignore unknown values
+            }
         }
         if !file.test_patterns.is_empty() {
             self.test_patterns = file.test_patterns;
@@ -211,25 +221,156 @@ fn default_allowlist() -> Vec<String> {
     ]
 }
 
-/// Detect test framework from package.json.
+/// Detect test framework using a multi-strategy approach:
+/// 1. project_root/package.json (deps + scoped + scripts)
+/// 2. Parent directory package.json traversal (monorepo)
+/// 3. Config file existence (vitest.config.ts, jest.config.ts, etc.)
 fn detect_framework(project_root: &Path) -> TestFramework {
+    // Strategy 1: project root package.json
     let pkg_path = project_root.join("package.json");
-    if let Ok(content) = std::fs::read_to_string(&pkg_path) {
-        if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content) {
-            // Check devDependencies and dependencies
-            for key in ["devDependencies", "dependencies"] {
-                if let Some(deps) = pkg.get(key).and_then(|v| v.as_object()) {
-                    if deps.contains_key("vitest") {
-                        return TestFramework::Vitest;
-                    }
-                    if deps.contains_key("jest") {
-                        return TestFramework::Jest;
-                    }
-                }
+    if let Some(fw) = detect_from_package_json(&pkg_path) {
+        return fw;
+    }
+
+    // Strategy 2: parent directory traversal (monorepo support, up to 5 levels)
+    if let Some(fw) = detect_from_parent_package_jsons(project_root) {
+        return fw;
+    }
+
+    // Strategy 3: config file existence
+    if let Some(fw) = detect_from_config_files(project_root) {
+        return fw;
+    }
+
+    TestFramework::Unknown
+}
+
+/// Detect framework from a single package.json file.
+/// Vitest-first: checks all vitest signals before jest signals.
+fn detect_from_package_json(pkg_path: &Path) -> Option<TestFramework> {
+    let content = std::fs::read_to_string(pkg_path).ok()?;
+    let pkg: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    // Collect all dependency keys
+    let has_dep = |name: &str| -> bool {
+        ["devDependencies", "dependencies"]
+            .iter()
+            .any(|key| pkg.get(key).and_then(|v| v.as_object()).is_some_and(|deps| deps.contains_key(name)))
+    };
+
+    let has_scoped = |prefix: &str| -> bool {
+        ["devDependencies", "dependencies"].iter().any(|key| {
+            pkg.get(key)
+                .and_then(|v| v.as_object())
+                .is_some_and(|deps| deps.keys().any(|k| k.starts_with(prefix)))
+        })
+    };
+
+    let scripts_contain = |needle: &str| -> bool {
+        pkg.get("scripts")
+            .and_then(|v| v.as_object())
+            .is_some_and(|scripts| {
+                scripts.values().any(|v| v.as_str().is_some_and(|s| s.contains(needle)))
+            })
+    };
+
+    // Vitest checks first (all of them before any jest check)
+    if has_dep("vitest") {
+        return Some(TestFramework::Vitest);
+    }
+    if has_scoped("@vitest/") {
+        return Some(TestFramework::Vitest);
+    }
+    if scripts_contain("vitest") {
+        return Some(TestFramework::Vitest);
+    }
+
+    // Jest checks
+    if has_dep("jest") {
+        return Some(TestFramework::Jest);
+    }
+    if has_scoped("@jest/") {
+        return Some(TestFramework::Jest);
+    }
+    if scripts_contain("jest") {
+        return Some(TestFramework::Jest);
+    }
+
+    None
+}
+
+/// Walk up parent directories (max 5 levels) looking for package.json with framework hints.
+fn detect_from_parent_package_jsons(project_root: &Path) -> Option<TestFramework> {
+    let mut current = project_root.parent()?;
+    for _ in 0..5 {
+        let pkg_path = current.join("package.json");
+        if let Some(fw) = detect_from_package_json(&pkg_path) {
+            return Some(fw);
+        }
+        current = current.parent()?;
+    }
+    None
+}
+
+/// Detect framework from config file existence.
+fn detect_from_config_files(project_root: &Path) -> Option<TestFramework> {
+    // Vitest config files
+    let vitest_configs = [
+        "vitest.config.ts",
+        "vitest.config.js",
+        "vitest.config.mts",
+        "vitest.config.mjs",
+        "vitest.workspace.ts",
+        "vitest.workspace.js",
+    ];
+    for name in vitest_configs {
+        if project_root.join(name).exists() {
+            return Some(TestFramework::Vitest);
+        }
+    }
+
+    // Jest config files
+    let jest_configs = [
+        "jest.config.ts",
+        "jest.config.js",
+        "jest.config.mjs",
+        "jest.config.cjs",
+    ];
+    for name in jest_configs {
+        if project_root.join(name).exists() {
+            return Some(TestFramework::Jest);
+        }
+    }
+
+    None
+}
+
+/// Infer framework by scanning test file contents for vi.mock/vi.fn vs jest.mock/jest.fn.
+/// Vitest-first: if any vi pattern is found, returns Vitest.
+pub fn infer_framework_from_test_files(files: &[PathBuf], max_files: usize) -> Option<TestFramework> {
+    let mut vi_found = false;
+    let mut jest_found = false;
+
+    for file in files.iter().take(max_files) {
+        if let Ok(content) = std::fs::read_to_string(file) {
+            if content.contains("vi.mock(") || content.contains("vi.fn(") {
+                vi_found = true;
+            }
+            if content.contains("jest.mock(") || content.contains("jest.fn(") {
+                jest_found = true;
+            }
+            // Early exit: vitest always wins
+            if vi_found {
+                return Some(TestFramework::Vitest);
             }
         }
     }
-    TestFramework::Unknown
+
+    if jest_found {
+        return Some(TestFramework::Jest);
+    }
+
+    None
 }
 
 /// Find tsconfig.json in the project root.
@@ -308,5 +449,203 @@ mod tests {
         assert!(config.is_allowed(Path::new("/project/src/types/user.ts")));
         assert!(config.is_allowed(Path::new("/project/src/constants/config.ts")));
         assert!(!config.is_allowed(Path::new("/project/src/services/api.ts")));
+    }
+
+    // ---- Framework detection tests ----
+
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn write_package_json(dir: &Path, content: &str) {
+        fs::write(dir.join("package.json"), content).unwrap();
+    }
+
+    #[test]
+    fn detect_from_package_json_vitest_dep() {
+        let tmp = TempDir::new().unwrap();
+        write_package_json(tmp.path(), r#"{"devDependencies":{"vitest":"^1.0.0"}}"#);
+        let result = detect_from_package_json(&tmp.path().join("package.json"));
+        assert_eq!(result, Some(TestFramework::Vitest));
+    }
+
+    #[test]
+    fn detect_from_package_json_jest_dep() {
+        let tmp = TempDir::new().unwrap();
+        write_package_json(tmp.path(), r#"{"devDependencies":{"jest":"^29.0.0"}}"#);
+        let result = detect_from_package_json(&tmp.path().join("package.json"));
+        assert_eq!(result, Some(TestFramework::Jest));
+    }
+
+    #[test]
+    fn detect_from_package_json_vitest_scoped() {
+        let tmp = TempDir::new().unwrap();
+        write_package_json(
+            tmp.path(),
+            r#"{"devDependencies":{"@vitest/coverage-v8":"^1.0.0"}}"#,
+        );
+        let result = detect_from_package_json(&tmp.path().join("package.json"));
+        assert_eq!(result, Some(TestFramework::Vitest));
+    }
+
+    #[test]
+    fn detect_from_package_json_jest_scoped() {
+        let tmp = TempDir::new().unwrap();
+        write_package_json(
+            tmp.path(),
+            r#"{"devDependencies":{"@jest/globals":"^29.0.0"}}"#,
+        );
+        let result = detect_from_package_json(&tmp.path().join("package.json"));
+        assert_eq!(result, Some(TestFramework::Jest));
+    }
+
+    #[test]
+    fn detect_from_package_json_vitest_script() {
+        let tmp = TempDir::new().unwrap();
+        write_package_json(tmp.path(), r#"{"scripts":{"test":"vitest run"}}"#);
+        let result = detect_from_package_json(&tmp.path().join("package.json"));
+        assert_eq!(result, Some(TestFramework::Vitest));
+    }
+
+    #[test]
+    fn detect_from_package_json_jest_script() {
+        let tmp = TempDir::new().unwrap();
+        write_package_json(tmp.path(), r#"{"scripts":{"test":"jest --coverage"}}"#);
+        let result = detect_from_package_json(&tmp.path().join("package.json"));
+        assert_eq!(result, Some(TestFramework::Jest));
+    }
+
+    #[test]
+    fn detect_from_package_json_vitest_wins_when_both_present() {
+        let tmp = TempDir::new().unwrap();
+        write_package_json(
+            tmp.path(),
+            r#"{"devDependencies":{"vitest":"^1.0.0","jest":"^29.0.0"}}"#,
+        );
+        let result = detect_from_package_json(&tmp.path().join("package.json"));
+        assert_eq!(result, Some(TestFramework::Vitest));
+    }
+
+    #[test]
+    fn detect_from_package_json_none_when_empty() {
+        let tmp = TempDir::new().unwrap();
+        write_package_json(tmp.path(), r#"{"name":"my-app"}"#);
+        let result = detect_from_package_json(&tmp.path().join("package.json"));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn detect_from_config_files_vitest() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("vitest.config.ts"), "").unwrap();
+        let result = detect_from_config_files(tmp.path());
+        assert_eq!(result, Some(TestFramework::Vitest));
+    }
+
+    #[test]
+    fn detect_from_config_files_jest() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("jest.config.ts"), "").unwrap();
+        let result = detect_from_config_files(tmp.path());
+        assert_eq!(result, Some(TestFramework::Jest));
+    }
+
+    #[test]
+    fn detect_from_config_files_vitest_workspace() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("vitest.workspace.ts"), "").unwrap();
+        let result = detect_from_config_files(tmp.path());
+        assert_eq!(result, Some(TestFramework::Vitest));
+    }
+
+    #[test]
+    fn detect_from_parent_package_jsons_monorepo() {
+        let tmp = TempDir::new().unwrap();
+        // Root has vitest
+        write_package_json(tmp.path(), r#"{"devDependencies":{"vitest":"^1.0.0"}}"#);
+        // Sub-project has no package.json with framework
+        let sub = tmp.path().join("packages").join("app");
+        fs::create_dir_all(&sub).unwrap();
+        write_package_json(&sub, r#"{"name":"app"}"#);
+
+        let result = detect_from_parent_package_jsons(&sub);
+        assert_eq!(result, Some(TestFramework::Vitest));
+    }
+
+    #[test]
+    fn detect_framework_full_fallthrough() {
+        // No package.json, no config files → Unknown
+        let tmp = TempDir::new().unwrap();
+        let result = detect_framework(tmp.path());
+        assert_eq!(result, TestFramework::Unknown);
+    }
+
+    #[test]
+    fn infer_framework_from_test_files_vitest() {
+        let tmp = TempDir::new().unwrap();
+        let test_file = tmp.path().join("app.test.ts");
+        fs::write(&test_file, "vi.mock('./module');\nvi.fn();").unwrap();
+        let result = infer_framework_from_test_files(&[test_file], 10);
+        assert_eq!(result, Some(TestFramework::Vitest));
+    }
+
+    #[test]
+    fn infer_framework_from_test_files_jest() {
+        let tmp = TempDir::new().unwrap();
+        let test_file = tmp.path().join("app.test.ts");
+        fs::write(&test_file, "jest.mock('./module');\njest.fn();").unwrap();
+        let result = infer_framework_from_test_files(&[test_file], 10);
+        assert_eq!(result, Some(TestFramework::Jest));
+    }
+
+    #[test]
+    fn infer_framework_from_test_files_vitest_wins_mixed() {
+        let tmp = TempDir::new().unwrap();
+        let f1 = tmp.path().join("a.test.ts");
+        let f2 = tmp.path().join("b.test.ts");
+        fs::write(&f1, "jest.mock('./x');").unwrap();
+        fs::write(&f2, "vi.mock('./y');").unwrap();
+        let result = infer_framework_from_test_files(&[f1, f2], 10);
+        assert_eq!(result, Some(TestFramework::Vitest));
+    }
+
+    #[test]
+    fn infer_framework_from_test_files_none() {
+        let tmp = TempDir::new().unwrap();
+        let test_file = tmp.path().join("app.test.ts");
+        fs::write(&test_file, "describe('test', () => {});").unwrap();
+        let result = infer_framework_from_test_files(&[test_file], 10);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn config_file_framework_override_vitest() {
+        let tmp = TempDir::new().unwrap();
+        // package.json says jest
+        write_package_json(tmp.path(), r#"{"devDependencies":{"jest":"^29.0.0"}}"#);
+        // isofence.json overrides to vitest
+        fs::write(
+            tmp.path().join("isofence.json"),
+            r#"{"framework":"vitest"}"#,
+        )
+        .unwrap();
+
+        let config = Config::load(tmp.path().to_path_buf());
+        assert_eq!(config.framework, TestFramework::Vitest);
+    }
+
+    #[test]
+    fn config_file_framework_override_jest() {
+        let tmp = TempDir::new().unwrap();
+        // vitest.config.ts exists
+        fs::write(tmp.path().join("vitest.config.ts"), "").unwrap();
+        // isofence.json overrides to jest
+        fs::write(
+            tmp.path().join("isofence.json"),
+            r#"{"framework":"jest"}"#,
+        )
+        .unwrap();
+
+        let config = Config::load(tmp.path().to_path_buf());
+        assert_eq!(config.framework, TestFramework::Jest);
     }
 }

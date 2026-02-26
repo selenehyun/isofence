@@ -4,8 +4,8 @@ use std::process;
 use clap::Parser;
 use ignore::WalkBuilder;
 
-use isofence::config::{Config, OutputFormat};
-use isofence::engine::context::is_test_file_path;
+use isofence::config::{infer_framework_from_test_files, Config, OutputFormat};
+use isofence::engine::context::{is_test_file_path, TestFramework};
 use isofence::engine::Engine;
 use isofence::fix;
 use isofence::progress::create_progress;
@@ -53,6 +53,10 @@ struct Cli {
     #[arg(long)]
     tsconfig: Option<PathBuf>,
 
+    /// Test framework override (vitest or jest)
+    #[arg(long)]
+    framework: Option<String>,
+
     /// Generate isofence.json template
     #[arg(long)]
     init: bool,
@@ -89,6 +93,17 @@ fn main() {
 
     if cli.no_consensus {
         config.mock_consensus = false;
+    }
+
+    // CLI --framework has highest priority
+    if let Some(ref fw) = cli.framework {
+        match fw.to_lowercase().as_str() {
+            "vitest" => config.framework = TestFramework::Vitest,
+            "jest" => config.framework = TestFramework::Jest,
+            other => {
+                eprintln!("Warning: Unknown framework '{other}'. Expected 'vitest' or 'jest'.");
+            }
+        }
     }
 
     if let Some(tsconfig) = cli.tsconfig {
@@ -154,6 +169,20 @@ fn main() {
             eprintln!("No test files found. Run `isofence --help` for usage.");
         }
         process::exit(0);
+    }
+
+    // Fallback: infer framework from test file contents if still unknown
+    if !config.framework.is_detected() {
+        if let Some(fw) = infer_framework_from_test_files(&test_files, 20) {
+            config.framework = fw;
+        }
+    }
+
+    // Warn if framework is still unknown and --fix is used
+    if !config.framework.is_detected() && config.fix {
+        eprintln!(
+            "Warning: Could not detect test framework. Defaulting to jest.mock. Use --framework to override."
+        );
     }
 
     // Run engine
@@ -280,6 +309,9 @@ fn generate_config_template() {
     "src/types/**",
     "src/constants/**"
   ],
+
+  // Test framework override: "vitest" or "jest" (auto-detected by default)
+  // "framework": "vitest",
 
   // Transitive dependency check depth (default: 1)
   // "depth": 2,
