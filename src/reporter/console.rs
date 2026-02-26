@@ -393,8 +393,10 @@ fn render_hazard_source(gutter: &str, hs: &HazardSource, project_root: &Path) {
         spaces = " ".repeat(display_col - 1),
         msg = hs.message,
     );
+    let line_num_padding = " ".repeat(4 + digit_count(line) + 1);
     println!(
-        " {gutter}      {sep} {annotation}",
+        " {gutter}{padding}{sep} {annotation}",
+        padding = line_num_padding,
         sep = "│".if_supports_color(Stdout, |s| s.dimmed()),
         annotation = annotation
             .if_supports_color(Stdout, |s| s.red())
