@@ -27,11 +27,19 @@ impl Reporter for ConsoleReporter {
         if let Some(ref tsconfig) = result.tsconfig_path {
             let rel = pathdiff::diff_paths(tsconfig, &self.project_root)
                 .unwrap_or_else(|| tsconfig.clone());
+            let link = terminal_hyperlink(tsconfig, &rel.display().to_string());
             println!(
                 "  tsconfig: {}",
-                rel.display()
-                    .to_string()
-                    .if_supports_color(Stdout, |s| s.dimmed()),
+                link.if_supports_color(Stdout, |s| s.dimmed()),
+            );
+        }
+        if let Some(ref config_path) = result.config_path {
+            let rel = pathdiff::diff_paths(config_path, &self.project_root)
+                .unwrap_or_else(|| config_path.clone());
+            let link = terminal_hyperlink(config_path, &rel.display().to_string());
+            println!(
+                "  config: {}",
+                link.if_supports_color(Stdout, |s| s.dimmed()),
             );
         }
         println!();

@@ -38,6 +38,7 @@ pub struct EngineResult {
     pub files_passed: usize,
     pub files_failed: usize,
     pub tsconfig_path: Option<PathBuf>,
+    pub config_path: Option<PathBuf>,
 }
 
 impl Engine {
@@ -152,6 +153,7 @@ impl Engine {
             files_passed,
             files_failed,
             tsconfig_path: self.config.tsconfig_path.clone(),
+            config_path: self.config.config_path.clone(),
         }
     }
 

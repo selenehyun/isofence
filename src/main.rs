@@ -78,8 +78,15 @@ fn main() {
         return;
     }
 
-    // Determine project root
-    let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // Determine project root from CLI path (first directory argument)
+    let project_root = cli
+        .paths
+        .first()
+        .and_then(|p| {
+            let dir = if p.is_dir() { p.clone() } else { p.parent()?.to_path_buf() };
+            dir.canonicalize().ok()
+        })
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     // Load config
     let mut config = Config::load(project_root.clone());

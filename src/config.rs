@@ -15,6 +15,7 @@ pub struct Config {
     pub mock_consensus: bool,
     pub framework: TestFramework,
     pub tsconfig_path: Option<PathBuf>,
+    pub config_path: Option<PathBuf>,
     pub custom_rules: Vec<PathBuf>,
     pub rule_configs: HashMap<String, RuleConfig>,
     pub format: OutputFormat,
@@ -86,6 +87,7 @@ impl Config {
             mock_consensus: true,
             framework,
             tsconfig_path,
+            config_path: None,
             custom_rules: Vec::new(),
             rule_configs: HashMap::new(),
             format: OutputFormat::Console,
@@ -105,6 +107,7 @@ impl Config {
             if let Ok(content) = std::fs::read_to_string(&config_path) {
                 if let Ok(file) = serde_json::from_str::<ConfigFile>(&content) {
                     config.merge_file(file);
+                    config.config_path = Some(config_path);
                 }
             }
         }
