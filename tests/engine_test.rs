@@ -1,10 +1,11 @@
 use isofence::engine::context::{
-    is_test_file_path, EdgeKind, MockDeclaration, MockKind, MutationImpact, TestFramework,
+    is_test_file_path, EdgeKind, MockDeclaration, MockKind, MutationImpact, SafeSignal,
+    TestFramework,
 };
 use isofence::engine::graph::ModuleGraph;
 use isofence::engine::parser::{
     analyze_export_mutation, collect_module_mutable_bindings, extract_exports, extract_imports,
-    extract_mocks, parse_source,
+    extract_mocks, extract_safe_signals, parse_source,
 };
 use oxc_allocator::Allocator;
 use oxc_span::Span;
@@ -37,6 +38,11 @@ mod context {
         assert!(is_test_file_path(&path("src/__tests__/foo.ts")));
         assert!(is_test_file_path(&path("src/foo.test.js")));
         assert!(is_test_file_path(&path("src/foo.spec.jsx")));
+        // Test infrastructure files
+        assert!(is_test_file_path(&path("src/data.mock.ts")));
+        assert!(is_test_file_path(&path("src/data.mock.tsx")));
+        assert!(is_test_file_path(&path("src/__mocks__/foo.ts")));
+        assert!(is_test_file_path(&path("src/__fixtures__/data.ts")));
     }
 
     #[test]
@@ -171,6 +177,76 @@ vi.mock('./logger', () => ({ log: vi.fn(), warn: vi.fn() }));
 
         assert_eq!(mocks.len(), 1);
         assert_eq!(mocks[0].kind, MockKind::Full);
+    }
+
+    #[test]
+    fn safe_signals_after_each_detected() {
+        let allocator = Allocator::default();
+        let source = r#"
+afterEach(() => {
+    vi.restoreAllMocks();
+});
+test('a', () => {});
+"#;
+        let result = parse_source(&allocator, source, &path("test.test.ts"));
+        let signals = extract_safe_signals(&result.program);
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0], SafeSignal::RestoreAllMocks);
+    }
+
+    #[test]
+    fn safe_signals_ignores_non_vi_calls() {
+        let allocator = Allocator::default();
+        let source = r#"
+beforeEach(() => {
+    myCache.clear();
+    someStore.reset();
+});
+test('a', () => {});
+"#;
+        let result = parse_source(&allocator, source, &path("test.test.ts"));
+        let signals = extract_safe_signals(&result.program);
+
+        assert!(
+            signals.is_empty(),
+            "Non-vi/jest calls like myCache.clear() should not be detected as safe signals, got: {:?}",
+            signals
+        );
+    }
+
+    #[test]
+    fn safe_signals_clear_all_mocks_detected() {
+        let allocator = Allocator::default();
+        let source = r#"
+beforeEach(() => {
+    vi.clearAllMocks();
+});
+test('a', () => {});
+"#;
+        let result = parse_source(&allocator, source, &path("test.test.ts"));
+        let signals = extract_safe_signals(&result.program);
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0], SafeSignal::ClearAllMocks);
+    }
+
+    #[test]
+    fn safe_signals_jest_prefix_detected() {
+        let allocator = Allocator::default();
+        let source = r#"
+afterEach(() => {
+    jest.clearAllMocks();
+    jest.resetAllMocks();
+});
+test('a', () => {});
+"#;
+        let result = parse_source(&allocator, source, &path("test.test.ts"));
+        let signals = extract_safe_signals(&result.program);
+
+        assert_eq!(signals.len(), 2);
+        assert!(signals.contains(&SafeSignal::ClearAllMocks));
+        assert!(signals.contains(&SafeSignal::ResetAllMocks));
     }
 }
 
@@ -1304,6 +1380,826 @@ export const allCategories = [...Object.values(SubCategory), ...Object.values(Ma
             reachability.is_empty(),
             "Enum spread array should NOT produce hazard-reachability diagnostic, got: {:?}",
             reachability.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn module_under_test_no_fix() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // invoice-filename-util.ts — has mutable state
+        let source_path = base.join("invoice-filename-util.ts");
+        std::fs::write(
+            &source_path,
+            "export let counter = 0;\nexport function formatName() { counter++; return 'inv'; }\n",
+        )
+        .unwrap();
+
+        // invoice-filename-util.test.ts — tests the module above
+        let test_path = base.join("invoice-filename-util.test.ts");
+        std::fs::write(
+            &test_path,
+            "import { formatName } from './invoice-filename-util';\ntest('format', () => { expect(formatName()).toBe('inv'); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &[source_path]);
+
+        let reachability: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        // Should have a diagnostic but NO fix (module-under-test)
+        assert!(
+            !reachability.is_empty(),
+            "Should still produce a diagnostic for the hazardous module-under-test"
+        );
+        assert!(
+            reachability.iter().all(|d| d.fix.is_none()),
+            "Module-under-test diagnostics should NOT have a fix, got: {:?}",
+            reachability.iter().map(|d| (&d.message, &d.fix)).collect::<Vec<_>>()
+        );
+        assert!(
+            reachability.iter().all(|d| d.severity == isofence::rule::Severity::Warning),
+            "Module-under-test diagnostics should be Warning severity"
+        );
+        let help = reachability[0].help.as_ref().unwrap();
+        assert!(
+            help.contains("module under test"),
+            "Help should mention 'module under test', got: {help}"
+        );
+    }
+
+    #[test]
+    fn module_under_test_in_tests_dir_no_fix() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // foo.ts at project root
+        let source_path = base.join("foo.ts");
+        std::fs::write(&source_path, "export let state = 0;\n").unwrap();
+
+        // __tests__/foo.test.ts
+        let tests_dir = base.join("__tests__");
+        std::fs::create_dir(&tests_dir).unwrap();
+        let test_path = tests_dir.join("foo.test.ts");
+        std::fs::write(
+            &test_path,
+            "import { state } from '../foo';\ntest('state', () => { expect(state).toBe(0); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &[source_path]);
+
+        let reachability: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        assert!(
+            !reachability.is_empty(),
+            "Should have diagnostic for hazardous module"
+        );
+        assert!(
+            reachability.iter().all(|d| d.fix.is_none()),
+            "__tests__/foo.test.ts → ../foo.ts should be detected as module-under-test (no fix)"
+        );
+        assert!(
+            reachability.iter().all(|d| d.severity == isofence::rule::Severity::Warning),
+            "Module-under-test from __tests__ dir should be Warning"
+        );
+    }
+
+    #[test]
+    fn mock_consensus_transitive_no_fix() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // db.ts — hazardous
+        let db_path = base.join("db.ts");
+        std::fs::write(&db_path, "export let connection = null;\n").unwrap();
+
+        // service.ts — imports db
+        let service_path = base.join("service.ts");
+        std::fs::write(
+            &service_path,
+            "import { connection } from './db';\nexport function getConn() { return connection; }\n",
+        )
+        .unwrap();
+
+        // test-a.test.ts — mocks db directly
+        let test_a = base.join("test-a.test.ts");
+        std::fs::write(
+            &test_a,
+            "vi.mock('./db');\nimport { connection } from './db';\ntest('a', () => {});\n",
+        )
+        .unwrap();
+
+        // test-b.test.ts — imports service (transitive dep on db), does NOT mock db
+        let test_b = base.join("test-b.test.ts");
+        std::fs::write(
+            &test_b,
+            "import { getConn } from './service';\ntest('b', () => { getConn(); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(
+            &[test_a, test_b.clone()],
+            &[db_path, service_path],
+        );
+
+        // mock-consensus diagnostics on test-b for db.ts
+        let consensus: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "mock-consensus" && d.file_path == test_b)
+            .collect();
+
+        // db.ts is transitively reachable from test-b via service → should have no fix
+        for diag in &consensus {
+            if diag.message.contains("db.ts") {
+                assert!(
+                    diag.fix.is_none(),
+                    "mock-consensus for transitive module db.ts should NOT have a fix, got: {:?}",
+                    diag.fix
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mock_consensus_direct_import_has_fix() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // config.ts — hazardous
+        let config_path = base.join("config.ts");
+        std::fs::write(&config_path, "export let dbUrl = 'localhost';\n").unwrap();
+
+        // test-a.test.ts — mocks config
+        let test_a = base.join("test-a.test.ts");
+        std::fs::write(
+            &test_a,
+            "vi.mock('./config');\nimport { dbUrl } from './config';\ntest('a', () => {});\n",
+        )
+        .unwrap();
+
+        // test-b.test.ts — imports config directly but doesn't mock
+        let test_b = base.join("test-b.test.ts");
+        std::fs::write(
+            &test_b,
+            "import { dbUrl } from './config';\ntest('b', () => { expect(dbUrl).toBeDefined(); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(
+            &[test_a, test_b.clone()],
+            &[config_path],
+        );
+
+        // mock-consensus on test-b for config.ts (direct import) → should have fix
+        let consensus: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                d.rule_name == "mock-consensus"
+                    && d.file_path == test_b
+                    && d.message.contains("config.ts")
+            })
+            .collect();
+
+        assert!(
+            !consensus.is_empty(),
+            "test-b should have mock-consensus diagnostic for config.ts"
+        );
+        assert!(
+            consensus[0].fix.is_some(),
+            "mock-consensus for directly imported config.ts should have a fix"
+        );
+    }
+
+    #[test]
+    fn mock_consensus_skips_module_under_test() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // foo.ts — has mutable state
+        let foo_path = base.join("foo.ts");
+        std::fs::write(&foo_path, "export let state = 0;\n").unwrap();
+
+        // test-a.test.ts — mocks foo
+        let test_a = base.join("test-a.test.ts");
+        std::fs::write(
+            &test_a,
+            "vi.mock('./foo');\nimport { state } from './foo';\ntest('a', () => {});\n",
+        )
+        .unwrap();
+
+        // foo.test.ts — the module-under-test for foo.ts, imports but doesn't mock
+        let test_foo = base.join("foo.test.ts");
+        std::fs::write(
+            &test_foo,
+            "import { state } from './foo';\ntest('foo state', () => { expect(state).toBe(0); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(
+            &[test_a, test_foo.clone()],
+            &[foo_path],
+        );
+
+        // mock-consensus should NOT produce diagnostic on foo.test.ts for foo.ts
+        let consensus_on_foo_test: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "mock-consensus" && d.file_path == test_foo)
+            .collect();
+
+        assert!(
+            consensus_on_foo_test.is_empty(),
+            "mock-consensus should skip module-under-test (foo.test.ts → foo.ts), got: {:?}",
+            consensus_on_foo_test.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn mock_consensus_skips_safe_only_imports() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // service.ts — has mutable state + safe export
+        let source_path = base.join("service.ts");
+        std::fs::write(
+            &source_path,
+            "let state = 0;\nexport function increment() { state++; }\nexport function safe() { return 42; }\n",
+        )
+        .unwrap();
+
+        // test-a.test.ts — mocks service
+        let test_a = base.join("test-a.test.ts");
+        std::fs::write(
+            &test_a,
+            "vi.mock('./service');\nimport { increment } from './service';\ntest('a', () => {});\n",
+        )
+        .unwrap();
+
+        // test-b.test.ts — only imports safe export, no mock
+        let test_b = base.join("test-b.test.ts");
+        std::fs::write(
+            &test_b,
+            "import { safe } from './service';\ntest('b', () => { expect(safe()).toBe(42); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(
+            &[test_a, test_b.clone()],
+            &[source_path],
+        );
+
+        // mock-consensus should NOT produce diagnostic on test-b for service.ts
+        let consensus_on_b: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "mock-consensus" && d.file_path == test_b)
+            .collect();
+
+        assert!(
+            consensus_on_b.is_empty(),
+            "mock-consensus should skip when test only imports safe exports, got: {:?}",
+            consensus_on_b.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn mock_consensus_keeps_unsafe_import_diagnostic() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // service.ts — has mutable state + safe export
+        let source_path = base.join("service.ts");
+        std::fs::write(
+            &source_path,
+            "let state = 0;\nexport function increment() { state++; }\nexport function safe() { return 42; }\n",
+        )
+        .unwrap();
+
+        // test-a.test.ts — mocks service
+        let test_a = base.join("test-a.test.ts");
+        std::fs::write(
+            &test_a,
+            "vi.mock('./service');\nimport { increment } from './service';\ntest('a', () => {});\n",
+        )
+        .unwrap();
+
+        // test-b.test.ts — imports the mutating export, no mock
+        let test_b = base.join("test-b.test.ts");
+        std::fs::write(
+            &test_b,
+            "import { increment } from './service';\ntest('b', () => { increment(); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(
+            &[test_a, test_b.clone()],
+            &[source_path],
+        );
+
+        // mock-consensus SHOULD produce diagnostic on test-b (unsafe import)
+        let consensus_on_b: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "mock-consensus" && d.file_path == test_b)
+            .collect();
+
+        assert!(
+            !consensus_on_b.is_empty(),
+            "mock-consensus should still produce diagnostic when test imports unsafe exports"
+        );
+        assert!(
+            consensus_on_b[0].fix.is_some(),
+            "mock-consensus diagnostic for directly imported unsafe module should have a fix"
+        );
+    }
+
+    #[test]
+    fn side_effect_import_no_fix() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // setup.ts — hazardous module
+        let setup_path = base.join("setup.ts");
+        std::fs::write(&setup_path, "let initialized = false;\ninitialized = true;\n").unwrap();
+
+        // test.test.ts — side-effect import only
+        let test_path = base.join("app.test.ts");
+        std::fs::write(
+            &test_path,
+            "import './setup';\ntest('app', () => {});\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &[setup_path]);
+
+        let reachability: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        // Should have diagnostic but NO fix and Warning severity
+        assert!(
+            !reachability.is_empty(),
+            "Side-effect import of hazardous module should produce diagnostic"
+        );
+        assert!(
+            reachability.iter().all(|d| d.fix.is_none()),
+            "Side-effect import should NOT have a fix, got: {:?}",
+            reachability.iter().map(|d| (&d.message, &d.fix)).collect::<Vec<_>>()
+        );
+        assert!(
+            reachability.iter().all(|d| d.severity == isofence::rule::Severity::Warning),
+            "Side-effect import diagnostic should be Warning severity"
+        );
+        let help = reachability[0].help.as_ref().unwrap();
+        assert!(
+            help.contains("Side-effect import"),
+            "Help should mention 'Side-effect import', got: {help}"
+        );
+    }
+
+    #[test]
+    fn reexport_from_safe_module_no_diagnostic() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // safe-util.ts — no hazards, only safe exports
+        let util_path = base.join("safe-util.ts");
+        std::fs::write(
+            &util_path,
+            "export function add(a: number, b: number) { return a + b; }\n",
+        )
+        .unwrap();
+
+        // barrel.ts — re-exports from safe-util
+        let barrel_path = base.join("barrel.ts");
+        std::fs::write(&barrel_path, "export { add } from './safe-util';\n").unwrap();
+
+        // test imports from barrel
+        let test_path = base.join("math.test.ts");
+        std::fs::write(
+            &test_path,
+            "import { add } from './barrel';\ntest('add', () => { expect(add(1,2)).toBe(3); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &[util_path, barrel_path]);
+
+        let reachability: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        assert!(
+            reachability.is_empty(),
+            "Re-export from safe module should NOT produce hazard-reachability diagnostic, got: {:?}",
+            reachability.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn reexport_from_hazardous_module_still_reported() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // hazardous.ts — has mutable state
+        let hazard_path = base.join("hazardous.ts");
+        std::fs::write(
+            &hazard_path,
+            "let counter = 0;\nexport function increment() { counter++; }\n",
+        )
+        .unwrap();
+
+        // barrel.ts — re-exports from hazardous
+        let barrel_path = base.join("barrel.ts");
+        std::fs::write(&barrel_path, "export { increment } from './hazardous';\n").unwrap();
+
+        // test imports from barrel
+        let test_path = base.join("inc.test.ts");
+        std::fs::write(
+            &test_path,
+            "import { increment } from './barrel';\ntest('inc', () => { increment(); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &[hazard_path, barrel_path]);
+
+        let reachability: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        assert!(
+            !reachability.is_empty(),
+            "Re-export from hazardous module should still produce diagnostic"
+        );
+    }
+
+    #[test]
+    fn mock_consensus_skips_non_hazardous_module() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // utils.ts — pure function, no hazards
+        let utils_path = base.join("utils.ts");
+        std::fs::write(
+            &utils_path,
+            "export function add(a: number, b: number) { return a + b; }\n",
+        )
+        .unwrap();
+
+        // test-a.test.ts — mocks utils (unnecessarily)
+        let test_a = base.join("test-a.test.ts");
+        std::fs::write(
+            &test_a,
+            "vi.mock('./utils');\nimport { add } from './utils';\ntest('a', () => {});\n",
+        )
+        .unwrap();
+
+        // test-b.test.ts — uses utils without mock
+        let test_b = base.join("test-b.test.ts");
+        std::fs::write(
+            &test_b,
+            "import { add } from './utils';\ntest('b', () => { expect(add(1,2)).toBe(3); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(
+            &[test_a, test_b.clone()],
+            &[utils_path],
+        );
+
+        let consensus_on_b: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "mock-consensus" && d.file_path == test_b)
+            .collect();
+
+        assert!(
+            consensus_on_b.is_empty(),
+            "mock-consensus should skip non-hazardous module, got: {:?}",
+            consensus_on_b.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn mock_consensus_keeps_hazardous_module_diagnostic() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // db.ts — hazardous (mutable state)
+        let db_path = base.join("db.ts");
+        std::fs::write(&db_path, "export let connection = null;\n").unwrap();
+
+        // test-a.test.ts — mocks db
+        let test_a = base.join("test-a.test.ts");
+        std::fs::write(
+            &test_a,
+            "vi.mock('./db');\nimport { connection } from './db';\ntest('a', () => {});\n",
+        )
+        .unwrap();
+
+        // test-b.test.ts — uses db without mock
+        let test_b = base.join("test-b.test.ts");
+        std::fs::write(
+            &test_b,
+            "import { connection } from './db';\ntest('b', () => { expect(connection).toBeNull(); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(
+            &[test_a, test_b.clone()],
+            &[db_path],
+        );
+
+        let consensus_on_b: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "mock-consensus" && d.file_path == test_b)
+            .collect();
+
+        assert!(
+            !consensus_on_b.is_empty(),
+            "mock-consensus should still report hazardous module"
+        );
+    }
+
+    #[test]
+    fn mock_consensus_guard_does_not_drop_reexport_hazards() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // hazardous.ts — mutable state
+        let hazard_path = base.join("hazardous.ts");
+        std::fs::write(&hazard_path, "export let state = 0;\n").unwrap();
+
+        // barrel.ts — re-exports from hazardous
+        let barrel_path = base.join("barrel.ts");
+        std::fs::write(&barrel_path, "export { state } from './hazardous';\n").unwrap();
+
+        // test-a.test.ts — mocks barrel
+        let test_a = base.join("test-a.test.ts");
+        std::fs::write(
+            &test_a,
+            "vi.mock('./barrel');\nimport { state } from './barrel';\ntest('a', () => {});\n",
+        )
+        .unwrap();
+
+        // test-b.test.ts — uses barrel without mock
+        let test_b = base.join("test-b.test.ts");
+        std::fs::write(
+            &test_b,
+            "import { state } from './barrel';\ntest('b', () => { expect(state).toBe(0); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(
+            &[test_a, test_b.clone()],
+            &[hazard_path, barrel_path],
+        );
+
+        let consensus_on_b: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "mock-consensus" && d.file_path == test_b)
+            .collect();
+
+        assert!(
+            !consensus_on_b.is_empty(),
+            "mock-consensus should keep diagnostic for barrel re-exporting hazardous module"
+        );
+    }
+
+    #[test]
+    fn mock_consensus_guard_skips_safe_reexport_barrel() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // safe-util.ts — no hazards
+        let safe_path = base.join("safe-util.ts");
+        std::fs::write(
+            &safe_path,
+            "export function add(a: number, b: number) { return a + b; }\n",
+        )
+        .unwrap();
+
+        // barrel.ts — re-exports from safe-util
+        let barrel_path = base.join("barrel.ts");
+        std::fs::write(&barrel_path, "export { add } from './safe-util';\n").unwrap();
+
+        // test-a.test.ts — mocks barrel
+        let test_a = base.join("test-a.test.ts");
+        std::fs::write(
+            &test_a,
+            "vi.mock('./barrel');\nimport { add } from './barrel';\ntest('a', () => {});\n",
+        )
+        .unwrap();
+
+        // test-b.test.ts — uses barrel without mock
+        let test_b = base.join("test-b.test.ts");
+        std::fs::write(
+            &test_b,
+            "import { add } from './barrel';\ntest('b', () => { expect(add(1,2)).toBe(3); });\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(
+            &[test_a, test_b.clone()],
+            &[safe_path, barrel_path],
+        );
+
+        let consensus_on_b: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "mock-consensus" && d.file_path == test_b)
+            .collect();
+
+        assert!(
+            consensus_on_b.is_empty(),
+            "mock-consensus should skip barrel that only re-exports safe modules, got: {:?}",
+            consensus_on_b.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn hazard_reachability_reset_modules_help_text() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // config.ts — hazardous
+        let config_path = base.join("config.ts");
+        std::fs::write(&config_path, "export let dbUrl = 'localhost';\n").unwrap();
+
+        // test.test.ts — has resetModules but doesn't mock config
+        let test_path = base.join("app.test.ts");
+        std::fs::write(
+            &test_path,
+            "beforeEach(() => { vi.resetModules(); });\nimport { dbUrl } from './config';\ntest('app', () => {});\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(&[test_path], &[config_path]);
+
+        let reachability: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "hazard-reachability")
+            .collect();
+
+        assert!(
+            !reachability.is_empty(),
+            "Should still produce hazard-reachability diagnostic even with resetModules"
+        );
+        let help = reachability[0].help.as_ref().unwrap();
+        assert!(
+            help.contains("resetModules()"),
+            "Help should mention resetModules(), got: {help}"
+        );
+        assert!(
+            help.contains("static imports"),
+            "Help should warn about static imports, got: {help}"
+        );
+    }
+
+    #[test]
+    fn mock_consensus_help_changes_with_cleanup_signal() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        // db.ts — hazardous
+        let db_path = base.join("db.ts");
+        std::fs::write(&db_path, "export let connection = null;\n").unwrap();
+
+        // test-a.test.ts — mocks db
+        let test_a = base.join("test-a.test.ts");
+        std::fs::write(
+            &test_a,
+            "vi.mock('./db');\nimport { connection } from './db';\ntest('a', () => {});\n",
+        )
+        .unwrap();
+
+        // test-b.test.ts — has cleanup but doesn't mock db
+        let test_b = base.join("test-b.test.ts");
+        std::fs::write(
+            &test_b,
+            "afterEach(() => { vi.restoreAllMocks(); });\nimport { connection } from './db';\ntest('b', () => {});\n",
+        )
+        .unwrap();
+
+        let config = Config::load(base.clone());
+        let mut registry = RuleRegistry::new();
+        registry.register_all(all_builtin_rules());
+
+        let engine = Engine::new(config, registry);
+        let result = engine.run_silent(
+            &[test_a, test_b.clone()],
+            &[db_path],
+        );
+
+        let consensus_on_b: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_name == "mock-consensus" && d.file_path == test_b)
+            .collect();
+
+        assert!(
+            !consensus_on_b.is_empty(),
+            "mock-consensus should still produce diagnostic"
+        );
+        let help = consensus_on_b[0].help.as_ref().unwrap();
+        assert!(
+            help.contains("Mock cleanup is present"),
+            "Help should mention cleanup is present, got: {help}"
         );
     }
 }

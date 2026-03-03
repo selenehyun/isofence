@@ -128,7 +128,8 @@ impl TestFramework {
 pub enum SafeSignal {
     ResetModules,
     RestoreAllMocks,
-    ClearState,
+    ClearAllMocks,
+    ResetAllMocks,
 }
 
 /// Context for a single module file — built once, shared across all rules.
@@ -210,12 +211,15 @@ pub struct TestContextSummary {
     pub framework: TestFramework,
 }
 
-/// Check if a file path looks like a test file.
+/// Check if a file path looks like a test file or test infrastructure.
 pub fn is_test_file_path(path: &Path) -> bool {
     let path_str = path.to_string_lossy();
 
-    // Check for __tests__ directory
-    if path_str.contains("__tests__") {
+    // Check for test directories
+    if path_str.contains("__tests__")
+        || path_str.contains("__mocks__")
+        || path_str.contains("__fixtures__")
+    {
         return true;
     }
 
@@ -230,6 +234,10 @@ pub fn is_test_file_path(path: &Path) -> bool {
             || lower.ends_with(".test.jsx")
             || lower.ends_with(".spec.js")
             || lower.ends_with(".spec.jsx")
+            // || lower.ends_with(".mock.ts")
+            // || lower.ends_with(".mock.tsx")
+            // || lower.ends_with(".mock.js")
+            // || lower.ends_with(".mock.jsx")
         {
             return true;
         }

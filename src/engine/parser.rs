@@ -247,13 +247,13 @@ pub fn extract_safe_signals(program: &Program<'_>) -> Vec<SafeSignal> {
     for stmt in &program.body {
         if let Some(expr) = get_expression_statement(stmt) {
             if let Expression::CallExpression(call) = expr {
-                // Check for beforeEach(...)
-                let is_before_each = match &call.callee {
-                    Expression::Identifier(id) => id.name.as_str() == "beforeEach",
+                // Check for beforeEach(...) or afterEach(...)
+                let is_lifecycle = match &call.callee {
+                    Expression::Identifier(id) => matches!(id.name.as_str(), "beforeEach" | "afterEach"),
                     _ => false,
                 };
 
-                if is_before_each {
+                if is_lifecycle {
                     // Check callback body for safe signals
                     if let Some(arg) = call.arguments.first() {
                         check_callback_for_signals(arg, &mut signals);
@@ -283,11 +283,19 @@ fn check_callback_for_signals(arg: &Argument<'_>, signals: &mut Vec<SafeSignal>)
         if let Some(expr) = get_expression_statement(stmt) {
             if let Expression::CallExpression(call) = expr {
                 if let Expression::StaticMemberExpression(member) = &call.callee {
+                    let is_vi_or_jest = match &member.object {
+                        Expression::Identifier(id) => matches!(id.name.as_str(), "vi" | "jest"),
+                        _ => false,
+                    };
+                    if !is_vi_or_jest {
+                        continue;
+                    }
                     let method = member.property.name.as_str();
                     match method {
                         "resetModules" => signals.push(SafeSignal::ResetModules),
                         "restoreAllMocks" => signals.push(SafeSignal::RestoreAllMocks),
-                        "clear" | "reset" => signals.push(SafeSignal::ClearState),
+                        "clearAllMocks" => signals.push(SafeSignal::ClearAllMocks),
+                        "resetAllMocks" => signals.push(SafeSignal::ResetAllMocks),
                         _ => {}
                     }
                 }

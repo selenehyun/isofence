@@ -11,7 +11,7 @@ use rayon::prelude::*;
 
 use crate::config::Config;
 use crate::engine::context::{
-    EdgeKind, GraphContext, MockKind, ModuleContext, TestContextSummary,
+    EdgeKind, GraphContext, MockKind, ModuleContext, SafeSignal, TestContextSummary,
 };
 use crate::engine::graph::ModuleGraph;
 use crate::engine::context::ExportAnalysis;
@@ -512,6 +512,7 @@ impl Engine {
             chain: Option<Vec<PathBuf>>,
             hazards: Vec<Hazard>,
             hazardous_imports: Vec<HazardousImport>,
+            is_side_effect_only: bool,
         }
 
         ctx.test_contexts
@@ -545,23 +546,31 @@ impl Engine {
                             &test_ctx.mocks,
                         );
 
-                        let chain_len = chain.as_ref().map_or(0, |c| c.len());
+                        // If no path found, skip (defensive guard against effective_subgraph mismatch)
+                        let Some(ref chain_vec) = chain else {
+                            continue;
+                        };
+                        let chain_len = chain_vec.len();
 
                         // Export-level filtering for direct imports
                         let mut hazardous_imports = Vec::new();
+                        let mut is_side_effect = false;
                         if chain_len <= 2 {
-                            if let Some(analyses) = ctx.export_analyses.get(module_path) {
-                                // Get import specifiers from test → module
-                                let import_names =
-                                    get_import_specifiers_for_module(&ctx.all_imports, test_file, module_path);
+                            // Get import specifiers from test → module
+                            let import_names =
+                                get_import_specifiers_for_module(&ctx.all_imports, test_file, module_path);
 
-                                if !import_names.is_empty() {
+                            if !import_names.is_empty() {
+                                if let Some(analyses) = ctx.export_analyses.get(module_path) {
                                     let matched = filter_analyses_by_imports(&import_names, analyses);
 
-                                    // Check if any matched export is unsafe
+                                    // Check if any matched export is unsafe (resolving re-exports)
                                     let has_unsafe = matched.iter().any(|a| {
+                                        let effective = resolve_reexport_impact(
+                                            a, module_path, &ctx.module_hazards, &ctx.all_imports
+                                        );
                                         matches!(
-                                            a.impact,
+                                            effective,
                                             MutationImpact::Mutating
                                                 | MutationImpact::Reading
                                                 | MutationImpact::Unknown
@@ -584,8 +593,11 @@ impl Engine {
                                         }
                                     }
                                 }
-                                // If import_names is empty (e.g., side-effect import),
-                                // fall through to standard diagnostic
+                            } else {
+                                // No named import specifiers — check if side-effect import only
+                                is_side_effect = is_side_effect_import_only(
+                                    &ctx.all_imports, test_file, module_path
+                                );
                             }
                         }
 
@@ -594,6 +606,7 @@ impl Engine {
                             chain,
                             hazards: hazards.clone(),
                             hazardous_imports,
+                            is_side_effect_only: is_side_effect,
                         };
 
                         if chain_len <= 2 {
@@ -613,20 +626,45 @@ impl Engine {
                 // Pass 2: Emit diagnostics into local vec
                 let mut diagnostics = Vec::new();
 
-                // Pass 2a: Emit direct hazard diagnostics (with fix)
+                // Pass 2a: Emit direct hazard diagnostics (with fix, unless module-under-test)
                 for entry in direct_hazards {
                     let module_rel = pathdiff::diff_paths(&entry.module_path, &self.config.project_root)
                         .unwrap_or_else(|| entry.module_path.clone());
+
+                    let is_mut = is_module_under_test(test_file, &entry.module_path);
 
                     let message = format!(
                         "Unmocked hazardous module `{}`",
                         module_rel.display()
                     );
 
-                    let help = if entry.hazardous_imports.is_empty() {
+                    let suppress_fix = is_mut || entry.is_side_effect_only;
+
+                    let has_reset_modules = test_ctx.safe_signals.iter().any(|s| {
+                        matches!(s, SafeSignal::ResetModules)
+                    });
+
+                    let help = if is_mut {
+                        "This is the module under test. Consider resetting mutable state in beforeEach instead of mocking.".to_string()
+                    } else if entry.is_side_effect_only {
+                        "Side-effect import — mocking would suppress the module's initialization. Consider an allowlist or manual reset.".to_string()
+                    } else if has_reset_modules {
+                        "Mock this module to isolate your tests. Note: vi.resetModules() only affects dynamic imports (await import()), not static imports.".to_string()
+                    } else if entry.hazardous_imports.is_empty() {
                         "Mock this module to isolate your tests.".to_string()
                     } else {
                         "Mock this module, or only import safe exports.".to_string()
+                    };
+
+                    let severity = if suppress_fix { Severity::Warning } else { Severity::Error };
+
+                    let fix = if suppress_fix {
+                        None
+                    } else {
+                        Some(Fix {
+                            text: entry.module_path.to_string_lossy().to_string(),
+                            span: oxc_span::Span::default(),
+                        })
                     };
 
                     let sources: Vec<HazardSource> = entry.hazards
@@ -642,15 +680,12 @@ impl Engine {
 
                     diagnostics.push(Diagnostic {
                         rule_name: "hazard-reachability".to_string(),
-                        severity: Severity::Error,
+                        severity,
                         message,
                         file_path: test_file.clone(),
                         span: oxc_span::Span::default(),
                         help: Some(help),
-                        fix: Some(Fix {
-                            text: entry.module_path.to_string_lossy().to_string(),
-                            span: oxc_span::Span::default(),
-                        }),
+                        fix,
                         import_chain: entry.chain,
                         hazard_sources: sources,
                         hazardous_imports: entry.hazardous_imports,
@@ -747,9 +782,57 @@ impl Engine {
     }
 }
 
+/// Detect whether `module_path` is the "module under test" for the given test file.
+/// E.g., `foo.test.ts` tests `foo.ts`, `__tests__/foo.test.ts` tests `../foo.ts`.
+pub(crate) fn is_module_under_test(test_file: &Path, module_path: &Path) -> bool {
+    let test_stem = test_file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+
+    // "foo.test" → "foo", "foo.spec" → "foo"
+    let base = test_stem
+        .strip_suffix(".test")
+        .or_else(|| test_stem.strip_suffix(".spec"))
+        .unwrap_or("");
+
+    if base.is_empty() {
+        return false;
+    }
+
+    let module_stem = module_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+
+    // Case 1: Same directory (foo.test.ts + foo.ts)
+    if test_file.parent() == module_path.parent() && module_stem == base {
+        return true;
+    }
+
+    // Case 2: __tests__ directory (__tests__/foo.test.ts + ../foo.ts)
+    if let Some(test_dir) = test_file.parent() {
+        let dir_name = test_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if dir_name == "__tests__" || dir_name == "__test__" {
+            if let Some(parent_of_tests) = test_dir.parent() {
+                if parent_of_tests == module_path.parent().unwrap_or(Path::new(""))
+                    && module_stem == base
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 /// Get import specifier names from `from` file importing `to` file.
 /// Merges multiple import declarations for the same target.
-fn get_import_specifiers_for_module(
+pub(crate) fn get_import_specifiers_for_module(
     all_imports: &HashMap<PathBuf, Vec<crate::engine::context::ImportInfo>>,
     from: &Path,
     to: &Path,
@@ -777,7 +860,7 @@ fn get_import_specifiers_for_module(
 }
 
 /// Filter export analyses by the names actually imported.
-fn filter_analyses_by_imports<'a>(
+pub(crate) fn filter_analyses_by_imports<'a>(
     import_names: &[String],
     analyses: &'a [ExportAnalysis],
 ) -> Vec<&'a ExportAnalysis> {
@@ -791,6 +874,58 @@ fn filter_analyses_by_imports<'a>(
         .iter()
         .filter(|a| names.contains(a.entry.exported_name.as_str()))
         .collect()
+}
+
+/// Check if a test file's import of a module is purely a side-effect import.
+fn is_side_effect_import_only(
+    all_imports: &HashMap<PathBuf, Vec<crate::engine::context::ImportInfo>>,
+    from: &Path,
+    to: &Path,
+) -> bool {
+    if let Some(imports) = all_imports.get(from) {
+        let matching: Vec<_> = imports
+            .iter()
+            .filter(|i| i.resolved_path.as_deref() == Some(to))
+            .collect();
+        !matching.is_empty() && matching.iter().all(|i| i.is_side_effect)
+    } else {
+        false
+    }
+}
+
+/// Resolve re-export impact by checking whether the source module has hazards.
+/// If the source module was analyzed and has no hazards, treat re-export as Safe.
+pub(crate) fn resolve_reexport_impact(
+    analysis: &ExportAnalysis,
+    module_path: &Path,
+    module_hazards: &HashMap<PathBuf, Vec<Hazard>>,
+    all_imports: &HashMap<PathBuf, Vec<crate::engine::context::ImportInfo>>,
+) -> crate::engine::context::MutationImpact {
+    use crate::engine::context::MutationImpact;
+
+    if analysis.impact != MutationImpact::Unknown || !analysis.entry.is_reexport {
+        return analysis.impact.clone();
+    }
+
+    if let Some(ref source_spec) = analysis.entry.source_specifier {
+        if let Some(imports) = all_imports.get(module_path) {
+            for imp in imports {
+                if imp.source == *source_spec {
+                    if let Some(ref resolved) = imp.resolved_path {
+                        // resolved in all_imports means it was analyzed
+                        let was_analyzed = all_imports.contains_key(resolved.as_path());
+                        if was_analyzed && !module_hazards.contains_key(resolved.as_path()) {
+                            return MutationImpact::Safe;
+                        }
+                        // Not analyzed or has hazards → Unknown
+                        return MutationImpact::Unknown;
+                    }
+                }
+            }
+        }
+    }
+
+    MutationImpact::Unknown
 }
 
 /// Result from analyzing a single file.
