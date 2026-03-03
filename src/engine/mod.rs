@@ -21,7 +21,7 @@ use crate::engine::parser::{
 };
 use crate::progress::{Progress, SilentProgress};
 use crate::rule::registry::RuleRegistry;
-use crate::rule::{Diagnostic, Fix, Hazard, HazardCategory, HazardSource, Severity};
+use crate::rule::{Diagnostic, Fix, Hazard, HazardCategory, HazardousImport, HazardSource, Severity};
 
 use std::collections::BTreeSet;
 
@@ -506,224 +506,227 @@ impl Engine {
     /// the diagnostic if the test imports Mutating/Reading/Unknown exports. Skip if only Safe.
     fn run_hazard_reachability(&self, ctx: &GraphContext, progress: &dyn Progress) -> Vec<Diagnostic> {
         use crate::engine::context::MutationImpact;
-        use crate::rule::HazardousImport;
 
-        let mut diagnostics = Vec::new();
+        struct HazardEntry {
+            module_path: PathBuf,
+            chain: Option<Vec<PathBuf>>,
+            hazards: Vec<Hazard>,
+            hazardous_imports: Vec<HazardousImport>,
+        }
 
-        for (test_file, test_ctx) in &ctx.test_contexts {
-            let effective = ctx.graph.effective_subgraph(test_file, &test_ctx.mocks);
-            progress.reachability_step();
+        ctx.test_contexts
+            .par_iter()
+            .flat_map(|(test_file, test_ctx)| {
+                let effective = ctx.graph.effective_subgraph(test_file, &test_ctx.mocks);
+                progress.reachability_step();
 
-            // Pass 1: Classify hazards as direct or transitive
-            struct HazardEntry {
-                module_path: PathBuf,
-                chain: Option<Vec<PathBuf>>,
-                hazards: Vec<Hazard>,
-                hazardous_imports: Vec<HazardousImport>,
-            }
+                // Pass 1: Classify hazards as direct or transitive
+                let mut direct_hazards: Vec<HazardEntry> = Vec::new();
+                // Transitive hazards grouped by first-hop module
+                let mut transitive_by_first_hop: HashMap<PathBuf, Vec<HazardEntry>> = HashMap::new();
 
-            let mut direct_hazards: Vec<HazardEntry> = Vec::new();
-            // Transitive hazards grouped by first-hop module
-            let mut transitive_by_first_hop: HashMap<PathBuf, Vec<HazardEntry>> = HashMap::new();
-
-            for module_path in &effective {
-                if module_path == test_file {
-                    continue;
-                }
-
-                if self.config.is_allowed(module_path) {
-                    continue;
-                }
-
-                if let Some(hazards) = ctx.module_hazards.get(module_path) {
-                    if hazards.is_empty() {
+                for module_path in &effective {
+                    if module_path == test_file {
                         continue;
                     }
 
-                    let chain = ctx.graph.shortest_unmocked_path(
-                        test_file,
-                        module_path,
-                        &test_ctx.mocks,
-                    );
+                    if self.config.is_allowed(module_path) {
+                        continue;
+                    }
 
-                    let chain_len = chain.as_ref().map_or(0, |c| c.len());
+                    if let Some(hazards) = ctx.module_hazards.get(module_path) {
+                        if hazards.is_empty() {
+                            continue;
+                        }
 
-                    // Export-level filtering for direct imports
-                    let mut hazardous_imports = Vec::new();
-                    if chain_len <= 2 {
-                        if let Some(analyses) = ctx.export_analyses.get(module_path) {
-                            // Get import specifiers from test → module
-                            let import_names =
-                                get_import_specifiers_for_module(&ctx.all_imports, test_file, module_path);
+                        let chain = ctx.graph.shortest_unmocked_path(
+                            test_file,
+                            module_path,
+                            &test_ctx.mocks,
+                        );
 
-                            if !import_names.is_empty() {
-                                let matched = filter_analyses_by_imports(&import_names, analyses);
+                        let chain_len = chain.as_ref().map_or(0, |c| c.len());
 
-                                // Check if any matched export is unsafe
-                                let has_unsafe = matched.iter().any(|a| {
-                                    matches!(
-                                        a.impact,
-                                        MutationImpact::Mutating
-                                            | MutationImpact::Reading
-                                            | MutationImpact::Unknown
-                                    )
-                                });
+                        // Export-level filtering for direct imports
+                        let mut hazardous_imports = Vec::new();
+                        if chain_len <= 2 {
+                            if let Some(analyses) = ctx.export_analyses.get(module_path) {
+                                // Get import specifiers from test → module
+                                let import_names =
+                                    get_import_specifiers_for_module(&ctx.all_imports, test_file, module_path);
 
-                                if !has_unsafe {
-                                    // All imported exports are safe → skip this diagnostic
-                                    continue;
-                                }
+                                if !import_names.is_empty() {
+                                    let matched = filter_analyses_by_imports(&import_names, analyses);
 
-                                // Build hazardous_imports detail
-                                for a in &matched {
-                                    if a.impact != MutationImpact::Safe {
-                                        hazardous_imports.push(HazardousImport {
-                                            symbol_name: a.entry.exported_name.clone(),
-                                            impact: a.impact.clone(),
-                                            referenced_bindings: a.referenced_bindings.clone(),
-                                        });
+                                    // Check if any matched export is unsafe
+                                    let has_unsafe = matched.iter().any(|a| {
+                                        matches!(
+                                            a.impact,
+                                            MutationImpact::Mutating
+                                                | MutationImpact::Reading
+                                                | MutationImpact::Unknown
+                                        )
+                                    });
+
+                                    if !has_unsafe {
+                                        // All imported exports are safe → skip this diagnostic
+                                        continue;
+                                    }
+
+                                    // Build hazardous_imports detail
+                                    for a in &matched {
+                                        if a.impact != MutationImpact::Safe {
+                                            hazardous_imports.push(HazardousImport {
+                                                symbol_name: a.entry.exported_name.clone(),
+                                                impact: a.impact.clone(),
+                                                referenced_bindings: a.referenced_bindings.clone(),
+                                            });
+                                        }
                                     }
                                 }
+                                // If import_names is empty (e.g., side-effect import),
+                                // fall through to standard diagnostic
                             }
-                            // If import_names is empty (e.g., side-effect import),
-                            // fall through to standard diagnostic
+                        }
+
+                        let entry = HazardEntry {
+                            module_path: module_path.clone(),
+                            chain,
+                            hazards: hazards.clone(),
+                            hazardous_imports,
+                        };
+
+                        if chain_len <= 2 {
+                            // Direct: test → hazardous module (chain = [test, module])
+                            direct_hazards.push(entry);
+                        } else {
+                            // Transitive: test → first_hop → ... → hazardous module
+                            let first_hop = entry.chain.as_ref().unwrap()[1].clone();
+                            transitive_by_first_hop
+                                .entry(first_hop)
+                                .or_default()
+                                .push(entry);
                         }
                     }
+                }
 
-                    let entry = HazardEntry {
-                        module_path: module_path.clone(),
-                        chain,
-                        hazards: hazards.clone(),
-                        hazardous_imports,
+                // Pass 2: Emit diagnostics into local vec
+                let mut diagnostics = Vec::new();
+
+                // Pass 2a: Emit direct hazard diagnostics (with fix)
+                for entry in direct_hazards {
+                    let module_rel = pathdiff::diff_paths(&entry.module_path, &self.config.project_root)
+                        .unwrap_or_else(|| entry.module_path.clone());
+
+                    let message = format!(
+                        "Unmocked hazardous module `{}`",
+                        module_rel.display()
+                    );
+
+                    let help = if entry.hazardous_imports.is_empty() {
+                        "Mock this module to isolate your tests.".to_string()
+                    } else {
+                        "Mock this module, or only import safe exports.".to_string()
                     };
 
-                    if chain_len <= 2 {
-                        // Direct: test → hazardous module (chain = [test, module])
-                        direct_hazards.push(entry);
-                    } else {
-                        // Transitive: test → first_hop → ... → hazardous module
-                        let first_hop = entry.chain.as_ref().unwrap()[1].clone();
-                        transitive_by_first_hop
-                            .entry(first_hop)
-                            .or_default()
-                            .push(entry);
-                    }
-                }
-            }
-
-            // Pass 2a: Emit direct hazard diagnostics (with fix)
-            for entry in direct_hazards {
-                let module_rel = pathdiff::diff_paths(&entry.module_path, &self.config.project_root)
-                    .unwrap_or_else(|| entry.module_path.clone());
-
-                let message = format!(
-                    "Unmocked hazardous module `{}`",
-                    module_rel.display()
-                );
-
-                let help = if entry.hazardous_imports.is_empty() {
-                    "Mock this module to isolate your tests.".to_string()
-                } else {
-                    "Mock this module, or only import safe exports.".to_string()
-                };
-
-                let sources: Vec<HazardSource> = entry.hazards
-                    .iter()
-                    .take(3)
-                    .map(|h| HazardSource {
-                        file_path: entry.module_path.clone(),
-                        span: h.span,
-                        message: h.message.clone(),
-                        category: h.category.clone(),
-                    })
-                    .collect();
-
-                diagnostics.push(Diagnostic {
-                    rule_name: "hazard-reachability".to_string(),
-                    severity: Severity::Error,
-                    message,
-                    file_path: test_file.clone(),
-                    span: oxc_span::Span::default(),
-                    help: Some(help),
-                    fix: Some(Fix {
-                        text: entry.module_path.to_string_lossy().to_string(),
-                        span: oxc_span::Span::default(),
-                    }),
-                    import_chain: entry.chain,
-                    hazard_sources: sources,
-                    hazardous_imports: entry.hazardous_imports,
-                });
-            }
-
-            // Pass 2b: Emit grouped transitive hazard diagnostics (no fix, Warning)
-            for (first_hop, entries) in &transitive_by_first_hop {
-                let first_hop_rel = pathdiff::diff_paths(first_hop, &self.config.project_root)
-                    .unwrap_or_else(|| first_hop.clone());
-
-                let count = entries.len();
-                let message = format!(
-                    "{count} transitive hazard(s) reachable via `{}`",
-                    first_hop_rel.display()
-                );
-
-                // Representative chain: use first entry
-                let representative_chain = entries[0].chain.clone();
-
-                // Collect up to 3 hazard sources across all entries (1 per module, up to 3)
-                let sources: Vec<HazardSource> = entries
-                    .iter()
-                    .take(3)
-                    .filter_map(|e| {
-                        e.hazards.first().map(|h| HazardSource {
-                            file_path: e.module_path.clone(),
+                    let sources: Vec<HazardSource> = entry.hazards
+                        .iter()
+                        .take(3)
+                        .map(|h| HazardSource {
+                            file_path: entry.module_path.clone(),
                             span: h.span,
                             message: h.message.clone(),
                             category: h.category.clone(),
                         })
-                    })
-                    .collect();
+                        .collect();
 
-                let help = {
-                    let mut items: Vec<String> = entries.iter()
-                        .map(|e| {
-                            let rel = pathdiff::diff_paths(&e.module_path, &self.config.project_root)
-                                .unwrap_or_else(|| e.module_path.clone());
-                            let cats: BTreeSet<String> = e.hazards.iter()
-                                .map(|h| h.category.to_string())
-                                .collect();
-                            let cat_str = cats.into_iter().collect::<Vec<_>>().join(", ");
-                            format!("`{}` ({})", rel.display(), cat_str)
+                    diagnostics.push(Diagnostic {
+                        rule_name: "hazard-reachability".to_string(),
+                        severity: Severity::Error,
+                        message,
+                        file_path: test_file.clone(),
+                        span: oxc_span::Span::default(),
+                        help: Some(help),
+                        fix: Some(Fix {
+                            text: entry.module_path.to_string_lossy().to_string(),
+                            span: oxc_span::Span::default(),
+                        }),
+                        import_chain: entry.chain,
+                        hazard_sources: sources,
+                        hazardous_imports: entry.hazardous_imports,
+                    });
+                }
+
+                // Pass 2b: Emit grouped transitive hazard diagnostics (no fix, Warning)
+                for (first_hop, entries) in &transitive_by_first_hop {
+                    let first_hop_rel = pathdiff::diff_paths(first_hop, &self.config.project_root)
+                        .unwrap_or_else(|| first_hop.clone());
+
+                    let count = entries.len();
+                    let message = format!(
+                        "{count} transitive hazard(s) reachable via `{}`",
+                        first_hop_rel.display()
+                    );
+
+                    // Representative chain: use first entry
+                    let representative_chain = entries[0].chain.clone();
+
+                    // Collect up to 3 hazard sources across all entries (1 per module, up to 3)
+                    let sources: Vec<HazardSource> = entries
+                        .iter()
+                        .take(3)
+                        .filter_map(|e| {
+                            e.hazards.first().map(|h| HazardSource {
+                                file_path: e.module_path.clone(),
+                                span: h.span,
+                                message: h.message.clone(),
+                                category: h.category.clone(),
+                            })
                         })
                         .collect();
-                    items.sort();
-                    items.dedup();
-                    if items.len() <= 3 {
-                        format!("Mock or allowlist: {}", items.join(", "))
-                    } else {
-                        let shown = items[..3].join(", ");
-                        let remaining = items.len() - 3;
-                        format!(
-                            "Mock or allowlist: {shown}, and {remaining} more (use --json for full list)"
-                        )
-                    }
-                };
 
-                diagnostics.push(Diagnostic {
-                    rule_name: "hazard-reachability".to_string(),
-                    severity: Severity::Warning,
-                    message,
-                    file_path: test_file.clone(),
-                    span: oxc_span::Span::default(),
-                    help: Some(help),
-                    fix: None,
-                    import_chain: representative_chain,
-                    hazard_sources: sources,
-                    hazardous_imports: vec![],
-                });
-            }
-        }
+                    let help = {
+                        let mut items: Vec<String> = entries.iter()
+                            .map(|e| {
+                                let rel = pathdiff::diff_paths(&e.module_path, &self.config.project_root)
+                                    .unwrap_or_else(|| e.module_path.clone());
+                                let cats: BTreeSet<String> = e.hazards.iter()
+                                    .map(|h| h.category.to_string())
+                                    .collect();
+                                let cat_str = cats.into_iter().collect::<Vec<_>>().join(", ");
+                                format!("`{}` ({})", rel.display(), cat_str)
+                            })
+                            .collect();
+                        items.sort();
+                        items.dedup();
+                        if items.len() <= 3 {
+                            format!("Mock or allowlist: {}", items.join(", "))
+                        } else {
+                            let shown = items[..3].join(", ");
+                            let remaining = items.len() - 3;
+                            format!(
+                                "Mock or allowlist: {shown}, and {remaining} more (use --json for full list)"
+                            )
+                        }
+                    };
 
-        diagnostics
+                    diagnostics.push(Diagnostic {
+                        rule_name: "hazard-reachability".to_string(),
+                        severity: Severity::Warning,
+                        message,
+                        file_path: test_file.clone(),
+                        span: oxc_span::Span::default(),
+                        help: Some(help),
+                        fix: None,
+                        import_chain: representative_chain,
+                        hazard_sources: sources,
+                        hazardous_imports: vec![],
+                    });
+                }
+
+                diagnostics
+            })
+            .collect()
     }
 
     /// Run Phase 3 graph-level rules.

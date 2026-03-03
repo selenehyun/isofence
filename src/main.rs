@@ -68,6 +68,10 @@ struct Cli {
     /// Show all files (disable truncation)
     #[arg(long)]
     all: bool,
+
+    /// Number of parallel threads (0 = all cores)
+    #[arg(short = 'j', long = "threads", env = "ISOFENCE_THREADS")]
+    threads: Option<usize>,
 }
 
 fn main() {
@@ -76,6 +80,14 @@ fn main() {
     if cli.init {
         generate_config_template();
         return;
+    }
+
+    // Initialize rayon thread pool if --threads or ISOFENCE_THREADS is set
+    if let Some(n) = cli.threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+            .expect("Failed to initialize thread pool");
     }
 
     // Determine project root from CLI path (first directory argument)
