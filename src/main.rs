@@ -296,10 +296,11 @@ fn discover_files(paths: &[PathBuf], _config: &Config) -> (Vec<PathBuf>, Vec<Pat
                 continue;
             }
 
+            let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
             if is_test_file_path(path) {
-                test_files.push(path.to_path_buf());
+                test_files.push(abs);
             } else {
-                source_files.push(path.to_path_buf());
+                source_files.push(abs);
             }
         }
     }
